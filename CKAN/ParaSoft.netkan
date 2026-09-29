@@ -23,11 +23,9 @@ description: >-
   Drag is never changed. Stock ModuleParachute, RealChute and FAR's RealChuteLite keep
   computing and applying all of their own forces; ParaSoft only simulates and draws the
   canopy and never pushes back on the craft.
-author:
-  - CritZitGaming
-$kref: >-
-  #/ckan/github/CritZitGaming/KSP-ParaSoft/version_from_asset/^ParaSoft-(?<version>[0-9.]+)\.zip$
+$kref: '#/ckan/github/CritZitGaming/KSP-ParaSoft'
 $vref: '#/ckan/ksp-avc/ParaSoft/ParaSoft.version'
+x_netkan_version_edit: ^v?(?<version>.+)$
 license: MIT
 tags:
   - plugin
@@ -45,10 +43,3 @@ supports:
   - name: CustomParachuteMessage
   - name: ReStock
   - name: KerbalFX-AeroFX
-resources:
-  homepage: https://github.com/CritZitGaming/KSP-ParaSoft
-  repository: https://github.com/CritZitGaming/KSP-ParaSoft
-  bugtracker: https://github.com/CritZitGaming/KSP-ParaSoft/issues
-install:
-  - find: ParaSoft
-    install_to: GameData

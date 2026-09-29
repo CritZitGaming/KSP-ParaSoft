@@ -55,9 +55,12 @@ into installing for a parachute mod.
 
 | Field | Reads from | Must stay in sync with |
 |---|---|---|
-| `$kref` … `version_from_asset` | the release asset filename | the zip name the workflow builds |
+| `$kref` `#/ckan/github/...` | the latest GitHub release and its zip asset | the zip the workflow attaches |
+| `x_netkan_version_edit` | the release's tag, with the leading `v` stripped | the git tag |
 | `$vref` `ksp-avc` | `ParaSoft/ParaSoft.version` inside the zip | the git tag, minus its leading `v` |
-| `install: find: ParaSoft` | the `ParaSoft` directory in the zip | the mod's folder name |
+| (no `install`) | CKAN's default: the directory named like the identifier | the `ParaSoft` folder at the zip root |
+
+This is the shape the CKAN team merged for Bennu and KSP Tethers.
 
 The version number therefore appears in four places for every release — the git tag, the zip
 filename, `ParaSoft.version`, and `AssemblyInfo.cs`. The release workflow fails the build if
