@@ -1,0 +1,12 @@
+# Let git normalise line endings for source and config, but never touch binaries.
+* text=auto
+
+*.png binary
+*.dds binary
+*.dll binary
+
+# Shell-executed in CI, must stay LF.
+*.yml text eol=lf
+
+# PowerShell is happier with CRLF on Windows.
+*.ps1 text eol=crlf

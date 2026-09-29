@@ -1,0 +1,99 @@
+name: Release
+
+# Tag a commit as e.g. v1.0.0 and push the tag. This builds the drop-in zip that CKAN's
+# GitHub indexer looks for and attaches it to a GitHub release.
+#
+# The plugin itself is not compiled here: building it needs KSP's own assemblies, which are
+# proprietary and cannot live in CI. ParaSoft/Plugins/ParaSoft.dll is committed, built
+# locally with Tools/Build.ps1, and the checks below refuse to publish a release whose DLL
+# does not carry the version being tagged.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the leading v (e.g. 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      # The canopy solver in Source/ParaSoft/Core has no Unity dependency, so the same
+      # behavioural checks that run locally run here too: a canopy must fill in air and stay
+      # limp in vacuum, lean downwind, hold a reef, land, float, survive Mach 1.9 and a
+      # 250 m/s opening. Timing checks only report here - shared runners are too variable.
+      # (The real-model checks need a KSP install and only run locally.)
+      - name: Run the solver checks
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mono-mcs
+          mkdir -p build
+          mcs -out:build/tests.exe -optimize+ Source/ParaSoft/Core/*.cs Tools/Tests.cs
+          mono build/tests.exe
+
+      - name: Check ParaSoft.version agrees with the tag
+        run: |
+          AVC=$(python3 -c "import json;v=json.load(open('ParaSoft/ParaSoft.version'))['VERSION'];print('%d.%d.%d'%(v['MAJOR'],v['MINOR'],v['PATCH']))")
+          if [ "$AVC" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::ParaSoft.version says $AVC but the tag says ${{ steps.ver.outputs.version }}. CKAN reads both; they must match."
+            exit 1
+          fi
+
+      - name: Check AssemblyInfo agrees with the tag
+        run: |
+          ASM=$(grep -oP 'AssemblyVersion\("\K[0-9]+\.[0-9]+\.[0-9]+' Source/ParaSoft/Properties/AssemblyInfo.cs)
+          if [ "$ASM" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::AssemblyInfo.cs says $ASM but the tag says ${{ steps.ver.outputs.version }}."
+            exit 1
+          fi
+
+      - name: Check the committed DLL was rebuilt for this version
+        run: |
+          DLL=ParaSoft/Plugins/ParaSoft.dll
+          test -f "$DLL" || { echo "::error::$DLL is missing. Run Tools/Build.ps1 and commit the result."; exit 1; }
+          # AssemblyFileVersion is stored as a literal string in the attribute blob, so a
+          # DLL built before the version bump will not contain the new one.
+          if ! grep -qa "${{ steps.ver.outputs.version }}.0" "$DLL"; then
+            echo "::error::$DLL does not carry version ${{ steps.ver.outputs.version }}. Rebuild it with Tools/Build.ps1 and commit before tagging."
+            exit 1
+          fi
+
+      - name: Build zip
+        run: |
+          mkdir -p build/staging
+          cp -r ParaSoft build/staging/
+          cp README.md LICENSE CHANGELOG.md build/staging/
+          cd build/staging
+          zip -r "../ParaSoft-${{ steps.ver.outputs.version }}.zip" \
+            ParaSoft README.md LICENSE CHANGELOG.md
+          cd ..
+          unzip -l "ParaSoft-${{ steps.ver.outputs.version }}.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.version }}" \
+            "build/ParaSoft-${{ steps.ver.outputs.version }}.zip" \
+            --title "ParaSoft Airbraking Technologies ${{ steps.ver.outputs.version }}" \
+            --generate-notes \
+            || gh release upload "v${{ steps.ver.outputs.version }}" \
+                 "build/ParaSoft-${{ steps.ver.outputs.version }}.zip" --clobber

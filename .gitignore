@@ -1,0 +1,20 @@
+# Release packaging output
+build/
+dist/
+*.zip
+
+# Build leftovers
+*.pdb
+*.mdb
+*.suo
+*.user
+obj/
+bin/
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Claude Code local settings (machine-specific paths, not portable)
+.claude/
