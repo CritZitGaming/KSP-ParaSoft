@@ -9,7 +9,7 @@ parachute you already have.**
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-lightgrey)](LICENSE)
 
 <!-- CKAN-PENDING:START — delete this whole block once the NetKAN PR is merged -->
-> ⏳ **Not on CKAN yet.** The listing has been submitted and is awaiting review.
+> ⏳ **Not on CKAN yet.** The listing is [submitted and awaiting review](https://github.com/KSP-CKAN/NetKAN/pull/11620).
 > Until it's merged, grab it from [Releases](https://github.com/CritZitGaming/KSP-ParaSoft/releases) — see [Manual install](#manual).
 <!-- CKAN-PENDING:END -->
 
@@ -103,7 +103,7 @@ separate canopies.
 ### CKAN (recommended)
 
 <!-- CKAN-PENDING:START — delete this block once the NetKAN PR is merged; the line below is already correct -->
-*Not available through CKAN yet — the listing is awaiting review by the CKAN team. Use the
+*Not available through CKAN yet — the [listing](https://github.com/KSP-CKAN/NetKAN/pull/11620) is awaiting review by the CKAN team. Use the
 manual install below in the meantime. Once it lands, this is all you'll need:*
 <!-- CKAN-PENDING:END -->
 
