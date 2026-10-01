@@ -53,6 +53,10 @@ internal static class ModelReport
             S("ReStock Mk25", g, @"ReStock\Assets\Utility\restock-parachute-drogue-125-1.mu", "B_ParachuteLargeDrogueRotator", "semiDeployLarge", "fullyDeployLarge", 0),
             S("ReStock Mk2-R", g, @"ReStock\Assets\Utility\restock-parachute-radial-1.mu", "B_ParachuteRoot", "semiDeployLarge", "fullyDeployLarge", 0),
             S("ReStock Mk12-R", g, @"ReStock\Assets\Utility\restock-parachute-drogue-radial-1.mu", "B_ParachuteRoot005", "semiDeployLarge", "fullyDeployLarge", 0),
+            S("CPM Encoded", g, @"CustomParachuteMessage\Models\model_canopyWithMessage.mu", "parachute", "chute_semi_deploy", "chute_full_deploy", 1),
+            // Lines gathered metres out on a riser, and modelled with vertices only at their ends.
+            S("BCS Starliner main", g, @"BoringCrewServices\Parts\Starliner\BCS_Centauri_MainChute.mu", "canopy", "semi_deploy", "full_deploy", 0),
+            S("BCS Starliner drogue", g, @"BoringCrewServices\Parts\Starliner\BCS_Centauri_DrogueChutes.mu", "canopy", "semiDeploy", "fullDeploy", 0),
         };
         for (var i = 2; i < args.Length; i++)
         {
@@ -147,7 +151,7 @@ internal static class ModelReport
             // Reproduction at rest must be exact, and a rigid motion of the lattice must
             // move every vertex rigidly with it.
             var rest = new Vec3[mv.Length];
-            emb.Evaluate(lattice.RestPositions, rest, null, null);
+            emb.Evaluate(lattice.RestPositions, Vec3.Zero, s.RiserJunction, rest, null, null);
             var maxRest = 0f;
             for (var i = 0; i < mv.Length; i++) maxRest = Math.Max(maxRest, Vec3.Distance(rest[i], mv[i]));
 
@@ -156,16 +160,26 @@ internal static class ModelReport
             var moved = new Vec3[lattice.ParticleCount];
             for (var i = 0; i < moved.Length; i++) moved[i] = q * lattice.RestPositions[i] + shift;
             var outp = new Vec3[mv.Length];
-            emb.Evaluate(moved, outp, null, null);
+            // The riser's lower end is the anchor, which moves with everything else here.
+            emb.Evaluate(moved, shift, q * s.RiserJunction + shift, outp, null, null);
             var maxRigid = 0f;
             for (var i = 0; i < mv.Length; i++) maxRigid = Math.Max(maxRigid, Vec3.Distance(outp[i], q * mv[i] + shift));
 
             var scale = s.MaxRadius;
-            var good = maxRest < 1e-3f * scale + 1e-4f && maxRigid < 2e-3f * scale + 1e-4f;
+            // Lines are a few centimetres thick. A line vertex far from the line it follows
+            // means the lattice's lines are not where the model's are, and that vertex will be
+            // flung about as they move. The riser also carries fittings near the part (ReStock's
+            // cluster joins its risers half a metre off them), so it is allowed a little more.
+            var lineLimit = Math.Max(0.35f, 0.04f * scale);
+            var riserLimit = Math.Max(0.6f, 0.15f * scale);
+            var good = maxRest < 1e-3f * scale + 1e-4f && maxRigid < 2e-3f * scale + 1e-4f
+                       && emb.MaxLineOffset < lineLimit && emb.MaxRiserOffset < riserLimit;
             if (!good) ok = false;
-            Console.WriteLine("    #{0}: R={1:0.###} hem R={2:0.###} h={3:0.###} lines={4:0.###} D0={5:0.###} sym={6:0.00} rms={7:0.000} dome/line verts={8}/{9} vent={10:0.##}R  rest err={11:0.0e0} rigid err={12:0.0e0} {13}",
-                c, s.MaxRadius, s.HemRadius, s.HemHeight, s.LineLength, s.NominalDiameter, s.Symmetry, s.RmsError,
-                emb.DomeCount, emb.LineCount, s.ProfileRho[0] / s.MaxRadius, maxRest / scale, maxRigid / scale, good ? "ok" : "BAD");
+            Console.WriteLine("    #{0}: R={1:0.###} hem R={2:0.###} h={3:0.###} lines={4:0.###} riser={5:0.##}{18} D0={6:0.###} sym={7:0.00} rms={8:0.000} dome/line/riser verts={9}/{10}/{11} vent={12:0.##}R  rest err={13:0.0e0} rigid err={14:0.0e0} off line/riser={15:0.00}/{16:0.00} m {17}",
+                c, s.MaxRadius, s.HemRadius, s.HemHeight, s.LineLength, s.RiserLength, s.NominalDiameter, s.Symmetry, s.RmsError,
+                emb.DomeCount, emb.LineCount, emb.RiserCount, s.ProfileRho[0] / s.MaxRadius, maxRest / scale, maxRigid / scale,
+                emb.MaxLineOffset, emb.MaxRiserOffset, good ? "ok" : "BAD",
+                s.RiserJunction.Length > 0f ? " (joined at " + s.RiserJunction.Length.ToString("0.##") + ")" : "");
         }
 
         Plot(spec, fit, verts, Path.Combine(outDir, spec.Label.Replace(' ', '_') + ".png"));

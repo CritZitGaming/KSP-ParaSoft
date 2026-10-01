@@ -178,8 +178,10 @@ namespace ParaSoft
                 model.Embeddings[c] = CanopyEmbedding.Compute(model.Lattices[c], mv, mn, mt);
             }
             var s0 = fit.Canopies[0];
-            Log.Info("{0}: {1} canopy(s), {2:0.0} m across, {3:0.0} m lines, {4} vertices, fitted in {5} ms.",
-                part.partInfo.title, fit.Canopies.Count, 2f * s0.MaxRadius, s0.LineLength, all.Length, sw.ElapsedMilliseconds);
+            Log.Info("{0}: {1} canopy(s), each {2:0.0} m across, {3:0.0} m lines{4}, {5} vertices, fitted in {6} ms.",
+                part.partInfo.title, fit.Canopies.Count, 2f * s0.MaxRadius, s0.LineLength,
+                s0.RiserLength > 0.01f ? " on a " + s0.RiserLength.ToString("0.0") + " m riser" : "",
+                all.Length, sw.ElapsedMilliseconds);
             return model;
         }
 

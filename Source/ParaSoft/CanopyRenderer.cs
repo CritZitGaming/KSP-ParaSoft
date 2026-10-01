@@ -45,6 +45,7 @@ namespace ParaSoft
         private bool visible;
         private bool originalsHidden;
         private int[] versions;
+        private Vec3[] riserEnds;
         private bool firstFrame = true;
 
         internal CanopyRenderer(CanopyModel model, List<Renderer> originals, string name)
@@ -136,10 +137,13 @@ namespace ParaSoft
             }
             firstFrame = false;
 
+            if (riserEnds == null || riserEnds.Length != sims.Length) riserEnds = new Vec3[sims.Length];
+            Vec3 junction;
+            RiserPath.Locate(sims, riserEnds, out junction);
             for (var c = 0; c < sims.Length; c++)
             {
                 if (sims[c] == null) continue;
-                model.Embeddings[c].Evaluate(sims[c].Positions, canopyPositions[c], canopyNormals[c], canopyTangents[c]);
+                model.Embeddings[c].Evaluate(sims[c].Positions, riserEnds[c], junction, canopyPositions[c], canopyNormals[c], canopyTangents[c]);
                 var members = model.Members[c];
                 for (var k = 0; k < members.Length; k++)
                 {

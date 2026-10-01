@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace ParaSoft.Core
 {
@@ -50,6 +51,14 @@ namespace ParaSoft.Core
         public float ExtractionTimeout = 5f;
         /// <summary>Stiffness multiplier on every fabric and line constraint.</summary>
         public float Stiffness = 1f;
+        /// <summary>
+        /// How firmly an open canopy's pull lines up with the air it meets, 0..1. Real round
+        /// canopies with a vent and porous cloth pull almost straight along the relative
+        /// wind, and that is what stops them swinging: a canopy moving sideways meets the air
+        /// at an angle and is pulled back. 0 leaves only the pressure on the cloth, which
+        /// swings and glides like a solid canopy with no vent.
+        /// </summary>
+        public float Stability = 0.8f;
 
         // Pressure coefficients - see docs/TECHNICAL.md, "Canopy aerodynamics".
         public float InternalPressure = 1.0f;
@@ -106,12 +115,31 @@ namespace ParaSoft.Core
         private readonly Vec3[] turbDir = new Vec3[3];
         private readonly Vec3[] turbWave = new Vec3[3];
         private readonly float[] turbPhase = new float[3];
+        private readonly Vec3 spreadDir;   // which way to go if a neighbour is right on top
 
         private Vec3 lastFrameVelocity;
         private bool haveFrameVelocity;
         private float extractTime;
         private float time;
         private float reefTarget = 1f;
+        private Vec3 flowDir;              // which way the air moves past the canopy
+        private Vec3 clusterForce;         // from neighbouring canopies, this frame
+        private float clusterArea;
+        private Vec3 contactA, contactB;   // this canopy's own contact volume, this frame
+        private bool haveContact;
+
+        /// <summary>
+        /// Other canopies close to this one, as capsules in this canopy's frame, with their
+        /// velocities relative to it. The game layer fills this before each step (see
+        /// CanopyContacts). Fabric is kept out of them, and the canopy as a whole is pushed
+        /// away from any it crowds - which is what spreads a cluster apart.
+        /// </summary>
+        public readonly List<CollisionCapsule> Neighbours = new List<CollisionCapsule>();
+
+        /// <summary>How close two canopies' contact volumes may come, as a multiple of their radii, before the air between them pushes them apart.</summary>
+        private const float ClusterSpacing = 1.1f;
+        /// <summary>That push at full overlap, in canopy drag areas.</summary>
+        private const float ClusterStiffness = 2.5f;
 
         public CanopyPhase Phase { get; private set; }
         public bool Anchored { get; private set; }
@@ -180,6 +208,7 @@ namespace ParaSoft.Core
                 turbWave[m] = new Vec3((float)rng.NextDouble() - 0.5f, (float)rng.NextDouble() - 0.5f, (float)rng.NextDouble() - 0.5f).NormalizedOr(Vec3.UnitY);
                 turbPhase[m] = (float)(rng.NextDouble() * Math.PI * 2);
             }
+            spreadDir = new Vec3((float)rng.NextDouble() - 0.5f, (float)rng.NextDouble() - 0.5f, (float)rng.NextDouble() - 0.5f).NormalizedOr(Vec3.UnitX);
 
             Phase = CanopyPhase.Stowed;
             Anchored = true;
@@ -348,6 +377,7 @@ namespace ParaSoft.Core
 
             UpdateMasses(env);
             UpdateCanopyState(dt, env);
+            UpdateClusterForce();
 
             // Gusts change on the scale of a canopy diameter, far slower than a substep,
             // so they are sampled once per frame.
@@ -411,6 +441,7 @@ namespace ParaSoft.Core
             }
             var rel = (mm > 0f ? mv / mm : Vec3.Zero) + env.FrameVelocity - env.AirVelocity;
             Speed = rel.Length;
+            flowDir = Speed > 1e-3f ? -rel / Speed : -CanopyAxis;
             Mach = env.SpeedOfSound > 1f ? Speed / env.SpeedOfSound : 0f;
             DynamicPressure = 0.5f * env.Density * Speed * Speed * MachFactor(Mach);
 
@@ -500,6 +531,10 @@ namespace ParaSoft.Core
             }
             var frameToAir = env.FrameVelocity - env.AirVelocity;
             var fill = Fill;
+            // Loose fabric meets the air as a plate; a full canopy is all ram pressure and
+            // wake. Leaving even a little plate drag on a full canopy lets its panels flutter
+            // at speed, and a small drogue then glides off 30 degrees to one side.
+            var plate = 1f - MathX.Clamp01(fill / Math.Max(0.05f, 1f - p.Porosity));
 
             var tris = Lattice.Triangles;
             for (var t = 0; t < tris.Length; t += 3)
@@ -522,7 +557,7 @@ namespace ParaSoft.Core
 
                 var cout = s >= 0f ? -p.BasePressure : -p.BasePressure + (p.WindwardPressure + p.BasePressure) * s * s;
                 var flat = p.FlatPlate * s * Math.Abs(s);
-                var dp = fill * qInf * (p.InternalPressure - cout) + (1f - fill) * qt * flat;
+                var dp = fill * qInf * (p.InternalPressure - cout) + plate * qt * flat;
                 var f = nrm * (area * dp);
                 if (us > 1e-4f)
                 {
@@ -537,6 +572,44 @@ namespace ParaSoft.Core
                 damping[a] += damp;
                 damping[b] += damp;
                 damping[c] += damp;
+            }
+
+            // Pressure on the cloth pulls along the canopy's own axis whichever way the air
+            // meets it, which leaves a canopy free to swing and glide. Turn that pull towards
+            // the air the canopy is actually meeting - its own sideways motion included, so a
+            // swing is met by a pull back.
+            if (p.Stability > 0f && fill > 0.05f)
+            {
+                var net = Vec3.Zero;
+                var mv = Vec3.Zero;
+                var mm = 0f;
+                var area = 0f;
+                for (var i = 0; i < Lattice.DomeCount; i++)
+                {
+                    if (!released[i]) continue;
+                    net += force[i];
+                    mv += v[i] * gravMass[i];
+                    mm += gravMass[i];
+                    area += Lattice.FabricArea[i];
+                }
+                var rel = (mm > 0f ? mv / mm : Vec3.Zero) + frameToAir;
+                var speed = rel.Length;
+                var pull = net.Length;
+                if (speed > 1f && pull > 0f && area > 0f)
+                {
+                    var along = rel * (-pull / speed);
+                    var corr = (along - net) * (MathX.Clamp01(p.Stability) * fill / area);
+                    for (var i = 0; i < Lattice.DomeCount; i++)
+                        if (released[i]) force[i] += corr * Lattice.FabricArea[i];
+                }
+            }
+
+            // Crowding by neighbouring canopies: spread over the fabric like a pressure,
+            // so the whole canopy moves off rather than just dimpling.
+            if (clusterArea > 0f)
+            {
+                for (var i = 0; i < Lattice.DomeCount; i++)
+                    if (released[i]) force[i] += clusterForce * (Lattice.FabricArea[i] / clusterArea);
             }
 
             // Cord drag: a cylinder in crossflow.
@@ -594,14 +667,18 @@ namespace ParaSoft.Core
         /// While extracting, the pilot particle is the deployment bag. Anything not yet
         /// pulled out rides along inside it; anything the bag has travelled far enough to
         /// pull out is let go where the bag is, so the canopy lays out behind it as a
-        /// streamer the way a real one leaves its bag.
+        /// streamer the way a real one leaves its bag. The riser comes out first, then the
+        /// lines, then the canopy from the hem to the crown.
         /// </summary>
         private void CarryPack(float h)
         {
             var bag = Lattice.PilotIndex;
             var conf = Lattice.ConfluenceIndex;
-            var reach = Vec3.Distance(pred[bag], pred[conf]);
-            var pull = (pred[bag] - pred[conf]).NormalizedOr(Lattice.Shape.Axis);
+            var bagDist = pred[bag].Length;
+            var pull = (pred[bag] / Math.Max(bagDist, 1e-6f)).NormalizedOr(Lattice.Shape.Axis);
+            if (riserLength > 0.01f) pred[conf] = pull * Math.Min(bagDist, riserLength);
+            // How much of the lines and canopy is out, measured from the confluence.
+            var reach = Math.Max(0f, bagDist - riserLength);
             var side1 = Vec3.AnyPerpendicular(pull);
             var side2 = Vec3.Cross(pull, side1);
             var timeout = extractTime > Parameters.ExtractionTimeout;
@@ -626,9 +703,8 @@ namespace ParaSoft.Core
                     // has got to this substep. Once that is reached the line is taut, and only
                     // the bag's sideways motion carries on: the outward part is what the
                     // snatch takes out.
-                    var max = Lattice.PayoutDistance[i] + riserLength;
                     var vel = v[bag];
-                    if (reach >= max)
+                    if (reach >= Lattice.PayoutDistance[i])
                     {
                         var outward = Vec3.Dot(vel, pull);
                         if (outward > 0f) vel -= pull * outward;
@@ -688,7 +764,7 @@ namespace ParaSoft.Core
             }
             var th = lat.GoreAngle(gore);
             var offset = (side1 * (float)Math.Cos(th) + side2 * (float)Math.Sin(th)) * spread;
-            var pay = Math.Min(reach, lat.PayoutDistance[i] + riserLength);
+            var pay = Math.Min(reach, lat.PayoutDistance[i]);
             if (isLine)
             {
                 var t = lineLen > 1e-4f ? pay / lineLen : 0f;
@@ -791,14 +867,18 @@ namespace ParaSoft.Core
 
         private void Collide(CollisionWorld world, float h)
         {
-            if (world == null) return;
-            var water = world.Water;
+            var neighbours = Phase == CanopyPhase.Flying ? Neighbours.Count : 0;
+            if (world == null && neighbours == 0) return;
+            var water = world != null ? world.Water : null;
             for (var i = 0; i < n; i++)
             {
                 if (invMass[i] <= 0f || !released[i]) continue;
                 if (i == Lattice.PilotIndex) continue;
                 var p = pred[i];
-                world.Resolve(ref p, x[i], collisionRadius, h);
+                if (world != null) world.Resolve(ref p, x[i], collisionRadius, h);
+                // Fabric on fabric slides easily.
+                for (var k = 0; k < neighbours; k++)
+                    CollisionWorld.PushOutOfCapsule(ref p, x[i], Neighbours[k], collisionRadius, h, 0.15f, haveContact, contactA, contactB);
                 if (water != null)
                 {
                     var c = water.Clearance(p);
@@ -878,28 +958,127 @@ namespace ParaSoft.Core
             }
         }
 
-        /// <summary>A sphere that roughly holds the inflated fabric.</summary>
-        public float BubbleRadius
+        private Vec3 RingCentre(Vec3[] pos, int ring)
         {
-            get { return Lattice.Shape.MaxRadius * MathX.Lerp(0.35f, 0.9f, Fill) * Math.Max(0.3f, Reef); }
+            var c = Vec3.Zero;
+            for (var g = 0; g < Lattice.Gores; g++) c += pos[Lattice.Dome(ring, g)];
+            return c / Lattice.Gores;
         }
 
         /// <summary>
-        /// Keeps this canopy's fabric out of a sphere (another canopy's bubble, in this
-        /// canopy's frame). Cluster canopies really do push each other apart like this.
+        /// The space this canopy's fabric takes up, for other canopies to keep out of: a
+        /// capsule from the hem's centre up towards the crown, as wide as the widest ring.
+        /// For an open canopy that is close to a sphere about the mouth; for a streamer or a
+        /// tightly reefed one it is long and thin. False while the canopy is still packed.
         /// </summary>
-        public void PushOutOfSphere(Vec3 centre, float radius, float strength)
+        public bool ContactCapsule(out Vec3 a, out Vec3 b, out float radius)
         {
-            var r2 = radius * radius;
-            for (var i = 0; i < Lattice.DomeCount; i++)
+            a = b = Vec3.Zero;
+            radius = 0f;
+            if (Phase != CanopyPhase.Flying) return false;
+            var hem = RingCentre(x, Lattice.Rings);
+            var vent = RingCentre(x, 0);
+            var r = 0f;
+            for (var k = 0; k <= Lattice.Rings; k++)
             {
-                if (!released[i] || invMass[i] <= 0f) continue;
-                var d = x[i] - centre;
-                var l2 = d.SqrLength;
-                if (l2 >= r2 || l2 < 1e-8f) continue;
-                var l = MathX.Sqrt(l2);
-                var push = (radius - l) * MathX.Clamp01(strength);
-                x[i] += d * (push / l);
+                var c = RingCentre(x, k);
+                var sum = 0f;
+                for (var g = 0; g < Lattice.Gores; g++) sum += Vec3.Distance(x[Lattice.Dome(k, g)], c);
+                r = Math.Max(r, sum / Lattice.Gores);
+            }
+            // A little inside the fabric, so neighbours touch rather than stand off.
+            r *= 0.95f;
+            if (!(r >= 1e-3f) || float.IsInfinity(r)) return false;
+            var along = vent - hem;
+            var len = along.Length;
+            a = hem;
+            b = len > r ? vent - along * (r / len) : hem;
+            radius = r;
+            return true;
+        }
+
+        /// <summary>
+        /// Canopies in a cluster push each other apart: the air squeezed out between them
+        /// has to go somewhere, and fabric pressed on fabric takes the shortest way round.
+        /// Worked out once a frame, across the flow, from how far this canopy's contact
+        /// volume crowds each neighbour's.
+        /// </summary>
+        private void UpdateClusterForce()
+        {
+            clusterForce = Vec3.Zero;
+            clusterArea = 0f;
+            haveContact = false;
+            if (Neighbours.Count == 0) return;
+            Vec3 a, b;
+            float r;
+            if (!ContactCapsule(out a, out b, out r)) return;
+            contactA = a;
+            contactB = b;
+            haveContact = true;
+            if (DynamicPressure <= 0f) return;
+            var drag = DynamicPressure * MathX.Pi * r * r;
+            for (var k = 0; k < Neighbours.Count; k++)
+            {
+                var nb = Neighbours[k];
+                Vec3 pi, pj;
+                Geometry.ClosestPoints(a, b, nb.A, nb.B, out pi, out pj);
+                var reach = (r + nb.Radius) * ClusterSpacing;
+                var d = pi - pj;
+                var dist = d.Length;
+                if (dist >= reach) continue;
+                // Sideways only: along the flow the lines already say where each canopy goes.
+                // Two canopies right on top of each other each take their own way out.
+                var side = Vec3.Reject(d, flowDir);
+                if (side.Length < 0.05f * reach) side += Vec3.Reject(spreadDir, flowDir) * (0.05f * reach);
+                var dir = side.NormalizedOr(Vec3.AnyPerpendicular(flowDir));
+                clusterForce += dir * (ClusterStiffness * drag * (reach - dist) / reach);
+            }
+            if (clusterForce.SqrLength <= 0f) return;
+            for (var i = 0; i < Lattice.DomeCount; i++)
+                if (released[i]) clusterArea += Lattice.FabricArea[i];
+        }
+
+        /// <summary>
+        /// Joins the confluences of a cluster whose lines all meet at one point: each canopy
+        /// pulls its own during a step, and afterwards they are put back together where the
+        /// pulls balance, moving as one. All the sims must share a frame.
+        /// </summary>
+        public static void TieConfluences(IList<CanopySim> sims)
+        {
+            if (sims == null || sims.Count < 2) return;
+            var p = Vec3.Zero;
+            var mv = Vec3.Zero;
+            var m = 0f;
+            foreach (var s in sims)
+            {
+                var c = s.Lattice.ConfluenceIndex;
+                if (!s.released[c]) return;
+                p += s.x[c];
+                mv += s.v[c] * s.gravMass[c];
+                m += s.gravMass[c];
+            }
+            p = p / sims.Count;
+            var vel = m > 0f ? mv / m : Vec3.Zero;
+            foreach (var s in sims)
+            {
+                var c = s.Lattice.ConfluenceIndex;
+                s.x[c] = p;
+                s.v[c] = vel;
+            }
+        }
+
+        /// <summary>
+        /// The lower end of the riser, in the frame: at the anchor while attached, and once
+        /// cut, trailing loose below the confluence.
+        /// </summary>
+        public Vec3 RiserEnd
+        {
+            get
+            {
+                if (Anchored) return Vec3.Zero;
+                var c = x[Lattice.ConfluenceIndex];
+                if (riserLength <= 0.01f) return c;
+                return c + (c - BubbleCentre).NormalizedOr(-CanopyAxis) * riserLength;
             }
         }
     }

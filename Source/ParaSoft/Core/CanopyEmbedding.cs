@@ -10,14 +10,16 @@ namespace ParaSoft.Core
     /// A fabric vertex is located by where it sits on the canopy surface (angle around the
     /// axis, distance down the meridian) and a small offset in that spot's local frame, so
     /// seams, scallops and double-sided fabric keep their shape. A line vertex is located by
-    /// how far it is down the suspension lines and which lines it sits between. Evaluating
-    /// on the rest lattice reproduces the model exactly; evaluating on the simulated lattice
-    /// gives the deformed canopy.
+    /// how far it is down the suspension lines and which lines it sits between. A riser
+    /// vertex - on the shock cord between the part and the confluence - by how far along
+    /// that cord it is. Evaluating on the rest lattice reproduces the model exactly;
+    /// evaluating on the simulated lattice gives the deformed canopy.
     /// </summary>
     public sealed class CanopyEmbedding
     {
         private const byte DomeRegion = 0;
         private const byte LineRegion = 1;
+        private const byte RiserRegion = 2;
 
         private readonly CanopyLattice lattice;
         private readonly byte[] region;
@@ -28,10 +30,21 @@ namespace ParaSoft.Core
         private readonly Vec3[] normal;    // in (t1, t2, n), may be null
         private readonly Vec3[] tangent;   // in (t1, t2, n), may be null
         private readonly float[] tangentW;
+        private float restJunctionLength;
 
         public int Count { get { return region.Length; } }
         public int DomeCount { get; private set; }
         public int LineCount { get; private set; }
+        public int RiserCount { get; private set; }
+
+        /// <summary>
+        /// Farthest any line vertex sits from the line it was matched to, at rest. Lines are
+        /// thin: anything more than a few centimetres means the lattice's lines are not where
+        /// the model's are, and that vertex will be dragged about as they move.
+        /// </summary>
+        public float MaxLineOffset { get; private set; }
+        /// <summary>The same for the riser, which also carries whatever fittings sit near the part.</summary>
+        public float MaxRiserOffset { get; private set; }
 
         private CanopyEmbedding(CanopyLattice lattice, int n, bool normals, bool tangents)
         {
@@ -60,7 +73,10 @@ namespace ParaSoft.Core
             var s = lattice.Shape;
             var rest = lattice.RestPositions;
             var confH = Vec3.Dot(s.Confluence, s.Axis);
-            var confRho = Vec3.Reject(s.Confluence, s.Axis).Length;
+            var hasRiser = s.RiserLength > 1e-3f;
+            var junction = s.RiserJunction;
+            var hasJunction = hasRiser && junction.Length > 1e-3f;
+            e.restJunctionLength = hasJunction ? junction.Length : 0f;
 
             for (var i = 0; i < vertices.Length; i++)
             {
@@ -75,17 +91,59 @@ namespace ParaSoft.Core
                 float domeDist;
                 var sParam = CanopyFitter.ProjectOntoProfile(s, rho, h, out domeDist);
 
-                // Distance to the line cone, in the same (rho, h) half-plane.
+                // Distance to the nearest line. Which line: the one whose hem point is where
+                // the ray from the confluence out through this vertex meets the hem's plane -
+                // the confluence need not be on the axis (a cluster's often is not), so the
+                // vertex's own angle round the axis is not the line's.
                 var hemRho = s.ProfileRho[s.ProfileRho.Length - 1];
                 var hemH = s.ProfileH[s.ProfileH.Length - 1];
-                var lineDist = MathX.Sqrt(CanopyFitter.DistToSegment2(rho, h, confRho, confH, hemRho, hemH));
-                var lx = hemRho - confRho;
-                var ly = hemH - confH;
-                var l2 = lx * lx + ly * ly;
-                var t = l2 > 1e-12f ? MathX.Clamp01(((rho - confRho) * lx + (h - confH) * ly) / l2) : 0f;
+                var ray = v - s.Confluence;
+                var rise = Vec3.Dot(ray, s.Axis);
+                var onHem = ray.Length > 0.02f * hemRho && rise > 1e-4f ? s.Confluence + ray * ((hemH - confH) / rise) : v;
+                var lineTheta = MathX.WrapAngle((float)Math.Atan2(Vec3.Dot(onHem, s.E2), Vec3.Dot(onHem, s.E1)));
+                var lineHem = s.Axis * hemH + (s.E1 * (float)Math.Cos(lineTheta) + s.E2 * (float)Math.Sin(lineTheta)) * hemRho;
+                var seg = lineHem - s.Confluence;
+                var l2 = seg.SqrLength;
+                var t = l2 > 1e-12f ? MathX.Clamp01(Vec3.Dot(ray, seg) / l2) : 0f;
+                var lineDist = Vec3.Distance(v, s.Confluence + seg * t);
+                var lgf = lineTheta / MathX.TwoPi * lattice.Gores;
+                var lg0 = Math.Min((int)lgf, lattice.Gores - 1);
+
+                // Distance to the riser: from the part to the junction a cluster's risers share,
+                // if any, then on to this canopy's confluence.
+                var riserDist = float.MaxValue;
+                var tr = 0f;
+                var rseg = 1;
+                if (hasRiser)
+                {
+                    var upper = s.Confluence - junction;
+                    tr = MathX.Clamp01(Vec3.Dot(v - junction, upper) / Math.Max(upper.SqrLength, 1e-12f));
+                    riserDist = Vec3.Distance(v, junction + upper * tr);
+                    if (hasJunction)
+                    {
+                        var tl = MathX.Clamp01(Vec3.Dot(v, junction) / junction.SqrLength);
+                        var dl = Vec3.Distance(v, junction * tl);
+                        if (dl < riserDist)
+                        {
+                            riserDist = dl;
+                            tr = tl;
+                            rseg = 0;
+                        }
+                    }
+                }
 
                 Vec3 point, t1, t2, nrm;
-                if (domeDist <= lineDist || t > 0.999f)
+                var region = LineRegion;
+                if (riserDist < lineDist && riserDist < domeDist)
+                {
+                    e.region[i] = RiserRegion;
+                    region = RiserRegion;
+                    e.RiserCount++;
+                    e.cellA[i] = rseg;
+                    e.fa[i] = tr;
+                    e.RiserFrame(rest, Vec3.Zero, junction, rseg, tr, s.Axis, out point, out t1, out t2, out nrm);
+                }
+                else if (domeDist <= lineDist || t > 0.999f)
                 {
                     e.region[i] = DomeRegion;
                     e.DomeCount++;
@@ -96,6 +154,7 @@ namespace ParaSoft.Core
                     e.gore[i] = g0;
                     e.fg[i] = gf - g0;
                     e.DomeFrame(rest, k0, g0, e.fa[i], e.fg[i], s.Axis, out point, out t1, out t2, out nrm);
+                    region = DomeRegion;
                 }
                 else
                 {
@@ -105,13 +164,15 @@ namespace ParaSoft.Core
                     var j0 = Math.Min((int)jf, lattice.LineSegments - 1);
                     e.cellA[i] = j0;
                     e.fa[i] = jf - j0;
-                    e.gore[i] = g0;
-                    e.fg[i] = gf - g0;
-                    e.LineFrame(rest, j0, g0, e.fa[i], e.fg[i], s.Axis, out point, out t1, out t2, out nrm);
+                    e.gore[i] = lg0;
+                    e.fg[i] = lgf - lg0;
+                    e.LineFrame(rest, j0, lg0, e.fa[i], e.fg[i], s.Axis, out point, out t1, out t2, out nrm);
                 }
 
                 var d = v - point;
                 e.offset[i] = new Vec3(Vec3.Dot(d, t1), Vec3.Dot(d, t2), Vec3.Dot(d, nrm));
+                if (region == LineRegion) e.MaxLineOffset = Math.Max(e.MaxLineOffset, d.Length);
+                else if (region == RiserRegion) e.MaxRiserOffset = Math.Max(e.MaxRiserOffset, d.Length);
                 if (normals != null)
                 {
                     var nn = normals[i];
@@ -130,9 +191,26 @@ namespace ParaSoft.Core
         /// <summary>
         /// Positions (and optionally normals and tangents) of every embedded vertex, given
         /// the lattice's particle positions. Output arrays must be Count long (tangents 4x).
+        /// The riser, if there is one, runs from the frame origin - the anchor on the part.
         /// </summary>
         public void Evaluate(Vec3[] particles, Vec3[] positions, Vec3[] normalsOut, float[] tangentsOut)
         {
+            Evaluate(particles, Vec3.Zero, positions, normalsOut, tangentsOut);
+        }
+
+        /// <param name="riserEnd">Where the riser's lower end is: the anchor, or wherever a cut riser trails to.</param>
+        public void Evaluate(Vec3[] particles, Vec3 riserEnd, Vec3[] positions, Vec3[] normalsOut, float[] tangentsOut)
+        {
+            // On its own, a canopy's share of a cluster's riser junction lies on its own riser.
+            var toConf = (particles[lattice.ConfluenceIndex] - riserEnd).NormalizedOr(lattice.Shape.Axis);
+            Evaluate(particles, riserEnd, riserEnd + toConf * restJunctionLength, positions, normalsOut, tangentsOut);
+        }
+
+        /// <param name="riserEnd">Where the riser's lower end is: the anchor, or wherever a cut riser trails to.</param>
+        /// <param name="riserJunction">Where a cluster's risers join (see RiserPath); ignored if the model has no junction.</param>
+        public void Evaluate(Vec3[] particles, Vec3 riserEnd, Vec3 riserJunction, Vec3[] positions, Vec3[] normalsOut, float[] tangentsOut)
+        {
+            if (restJunctionLength <= 0f) riserJunction = riserEnd;
             // A canopy axis for the degenerate cases - fully collapsed rings - taken from the
             // vent towards... the confluence, reversed.
             var ventCentre = Vec3.Zero;
@@ -147,8 +225,10 @@ namespace ParaSoft.Core
                 Vec3 point, t1, t2, nrm;
                 if (region[i] == DomeRegion)
                     DomeFrame(particles, cellA[i], gore[i], fa[i], fg[i], axis, out point, out t1, out t2, out nrm);
-                else
+                else if (region[i] == LineRegion)
                     LineFrame(particles, cellA[i], gore[i], fa[i], fg[i], axis, out point, out t1, out t2, out nrm);
+                else
+                    RiserFrame(particles, riserEnd, riserJunction, cellA[i], fa[i], axis, out point, out t1, out t2, out nrm);
 
                 var o = offset[i];
                 positions[i] = point + t1 * o.X + t2 * o.Y + nrm * o.Z;
@@ -201,6 +281,22 @@ namespace ParaSoft.Core
             // the hem instead, where the lines are always apart.
             var hoop = p[lattice.Dome(lattice.Rings, g1)] - p[lattice.Dome(lattice.Rings, g0)];
             MakeFrame(hoop, along, axis, point, out t1, out t2, out n);
+        }
+
+        /// <summary>
+        /// A point on the riser - segment 0 from its lower end to the junction, segment 1 on
+        /// to the confluence - framed so that it turns with the canopy: its first side
+        /// direction is taken across the hem.
+        /// </summary>
+        private void RiserFrame(Vec3[] p, Vec3 end, Vec3 junction, int segment, float f, Vec3 axis,
+                                out Vec3 point, out Vec3 t1, out Vec3 t2, out Vec3 n)
+        {
+            var from = segment == 0 ? end : junction;
+            var to = segment == 0 ? junction : p[lattice.ConfluenceIndex];
+            var along = to - from;
+            point = from + along * f;
+            var across = p[lattice.Dome(lattice.Rings, 0)] - p[lattice.Dome(lattice.Rings, lattice.Gores / 2)];
+            MakeFrame(across, along, axis, point, out t1, out t2, out n);
         }
 
         /// <summary>

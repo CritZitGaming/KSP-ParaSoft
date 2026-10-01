@@ -45,7 +45,8 @@ namespace ParaSoft
         public bool evaChutes = true;
 
         [GameParameters.CustomIntParameterUI("Cut canopies linger (s)", minValue = 0, maxValue = 120,
-            toolTip = "How long a cut canopy keeps flying before it is removed.")]
+            toolTip = "Longest a cut canopy keeps flying. It goes sooner once it is out of range " +
+                      "(750 m from the camera and your craft) or has settled on the ground or sea. 0 removes it at once.")]
         public int detachedLifetime = 30;
 
         public override string Title { get { return "ParaSoft Airbraking Technologies"; } }

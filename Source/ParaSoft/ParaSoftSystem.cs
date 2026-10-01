@@ -1,14 +1,15 @@
 using System;
 using System.Collections.Generic;
 using ParaSoft.Core;
+using ParaSoft.Environment;
 using UnityEngine;
 
 namespace ParaSoft
 {
     /// <summary>
     /// Runs every canopy in the flight scene from one place, so the budget (how many
-    /// canopies at once, how often distant ones step) and canopy-to-canopy contact can be
-    /// handled together instead of per part.
+    /// canopies at once, how often distant ones step), canopy-to-canopy contact and each
+    /// craft's airflow can be handled together instead of per part.
     /// </summary>
     [KSPAddon(KSPAddon.Startup.Flight, false)]
     public class ParaSoftSystem : MonoBehaviour
@@ -17,10 +18,12 @@ namespace ParaSoft
 
         private readonly List<CanopyController> controllers = new List<CanopyController>();
         private readonly List<DetachedCanopy> detached = new List<DetachedCanopy>();
+        private readonly Dictionary<Vessel, CraftFlow> flows = new Dictionary<Vessel, CraftFlow>();
+        private readonly List<Vessel> staleFlows = new List<Vessel>();
+        private int physicsFrame;
 
-        // Scratch lists for canopy contact, reused every frame.
-        private readonly List<CanopySim> contactSims = new List<CanopySim>();
-        private readonly List<Vector3> contactAnchors = new List<Vector3>();
+        /// <summary>Every open canopy's contact volume this frame, in world space.</summary>
+        internal readonly CanopyContacts Contacts = new CanopyContacts();
 
         public void Awake()
         {
@@ -34,7 +37,26 @@ namespace ParaSoft
             foreach (var d in detached) d.Dispose();
             controllers.Clear();
             detached.Clear();
+            flows.Clear();
             if (Instance == this) Instance = null;
+        }
+
+        /// <summary>The craft's airflow tracker, brought up to date for this physics frame.</summary>
+        internal CraftFlow FlowFor(Vessel vessel)
+        {
+            if (vessel == null) return null;
+            CraftFlow flow;
+            if (!flows.TryGetValue(vessel, out flow))
+            {
+                flow = new CraftFlow(vessel);
+                flows[vessel] = flow;
+            }
+            if (flow.LastFrame != physicsFrame)
+            {
+                flow.LastFrame = physicsFrame;
+                flow.Update(TimeWarp.fixedDeltaTime);
+            }
+            return flow;
         }
 
         internal void Register(CanopyController c)
@@ -76,6 +98,9 @@ namespace ParaSoft
             var dt = TimeWarp.fixedDeltaTime;
             if (dt <= 0f) return;
             var camera = CameraPosition;
+            physicsFrame++;
+            if ((physicsFrame & 255) == 0) PruneFlows();
+            GatherContacts();
 
             for (var i = controllers.Count - 1; i >= 0; i--)
             {
@@ -93,7 +118,7 @@ namespace ParaSoft
             for (var i = detached.Count - 1; i >= 0; i--)
             {
                 var d = detached[i];
-                try { d.FixedStep(dt, camera); }
+                try { d.FixedStep(dt, camera, this); }
                 catch (Exception e)
                 {
                     Log.Exception("stepping a cut canopy", e);
@@ -107,55 +132,38 @@ namespace ParaSoft
                     detached.RemoveAt(i);
                 }
             }
-
-            CanopyContact();
         }
 
         /// <summary>
-        /// Keeps canopies out of each other. Each inflated canopy is a rough sphere to the
-        /// others; fabric that strays inside one is pushed back out, which is how the
-        /// canopies of a cluster spread apart.
+        /// Where every open canopy is, before any of them steps, so each can be kept out of
+        /// the others - its cluster-mates, the other chutes on the craft, other craft's, and
+        /// cut canopies drifting past.
         /// </summary>
-        private void CanopyContact()
+        private void GatherContacts()
         {
-            contactSims.Clear();
-            contactAnchors.Clear();
+            Contacts.Clear();
             foreach (var c in controllers)
             {
-                if (!c.Active) continue;
-                var a = c.Anchor;
-                foreach (var s in c.Sims)
-                {
-                    if (s.Phase != CanopyPhase.Flying) continue;
-                    contactSims.Add(s);
-                    contactAnchors.Add(a);
-                }
+                if (c.Disposed || !c.Active) continue;
+                var origin = c.Anchor.ToVec3();
+                var velocity = c.FrameVelocity.ToVec3();
+                foreach (var s in c.Sims) Contacts.Add(s, origin, velocity);
             }
             foreach (var d in detached)
             {
-                var a = d.Anchor;
-                foreach (var s in d.Sims)
-                {
-                    contactSims.Add(s);
-                    contactAnchors.Add(a);
-                }
+                if (d.Finished) continue;
+                var origin = d.Anchor.ToVec3();
+                var velocity = d.FrameVelocity.ToVec3();
+                foreach (var s in d.Sims) Contacts.Add(s, origin, velocity);
             }
+        }
 
-            for (var i = 0; i < contactSims.Count; i++)
-            {
-                var si = contactSims[i];
-                var ci = contactAnchors[i] + si.BubbleCentre.ToVector3();
-                var ri = si.BubbleRadius;
-                for (var j = i + 1; j < contactSims.Count; j++)
-                {
-                    var sj = contactSims[j];
-                    var cj = contactAnchors[j] + sj.BubbleCentre.ToVector3();
-                    var rj = sj.BubbleRadius;
-                    if ((ci - cj).sqrMagnitude >= (ri + rj) * (ri + rj)) continue;
-                    si.PushOutOfSphere((cj - contactAnchors[i]).ToVec3(), rj, 0.35f);
-                    sj.PushOutOfSphere((ci - contactAnchors[j]).ToVec3(), ri, 0.35f);
-                }
-            }
+        private void PruneFlows()
+        {
+            staleFlows.Clear();
+            foreach (var kv in flows)
+                if (kv.Key == null || !kv.Key.loaded || kv.Value.LastFrame < physicsFrame - 100) staleFlows.Add(kv.Key);
+            foreach (var v in staleFlows) flows.Remove(v);
         }
 
         public void LateUpdate()

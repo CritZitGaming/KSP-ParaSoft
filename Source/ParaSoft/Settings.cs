@@ -17,12 +17,15 @@ namespace ParaSoft
         internal static float FillDistance = 2.5f;
         internal static float ApparentMass = 0.35f;
         internal static float Stiffness = 1f;
+        internal static float Stability = 0.8f;
         internal static float EjectSpeed = 12f;
         internal static float SubstepsPerSecond = 200f;
         /// <summary>Beyond this distance from the camera a canopy runs at half rate.</summary>
         internal static float LodDistance = 600f;
         /// <summary>Beyond this distance a canopy is frozen until the camera comes back.</summary>
         internal static float FreezeDistance = 2500f;
+        /// <summary>A cut canopy this far from both the camera and the active craft is removed.</summary>
+        internal static float CutCanopyRange = 750f;
         /// <summary>Most canopies simulated at once; any more keep their stock animation.</summary>
         internal static int MaxCanopies = 24;
         /// <summary>Largest vertex count a canopy model may have before it is left alone.</summary>
@@ -49,10 +52,12 @@ namespace ParaSoft
                 Read(n, "fillDistance", ref FillDistance, 0.3f, 20f);
                 Read(n, "apparentMass", ref ApparentMass, 0f, 3f);
                 Read(n, "stiffness", ref Stiffness, 0.1f, 10f);
+                Read(n, "stability", ref Stability, 0f, 1f);
                 Read(n, "ejectSpeed", ref EjectSpeed, 0f, 60f);
                 Read(n, "substepsPerSecond", ref SubstepsPerSecond, 100f, 1000f);
                 Read(n, "lodDistance", ref LodDistance, 50f, 100000f);
                 Read(n, "freezeDistance", ref FreezeDistance, 100f, 100000f);
+                Read(n, "cutCanopyRange", ref CutCanopyRange, 50f, 100000f);
                 float maxc = MaxCanopies;
                 Read(n, "maxCanopies", ref maxc, 1f, 500f);
                 MaxCanopies = (int)maxc;
@@ -104,6 +109,7 @@ namespace ParaSoft
                 FillDistance = FillDistance,
                 ApparentMass = ApparentMass,
                 Stiffness = Stiffness,
+                Stability = Stability,
                 EjectSpeed = EjectSpeed,
                 MaxSubstep = 1f / SubstepsPerSecond
             };

@@ -8,8 +8,8 @@ namespace ParaSoft.Core
     ///
     /// Everything is expressed in the canopy transform's frame: position and rotation of
     /// the transform the parachute module hangs the canopy from, with its scale removed.
-    /// The lines converge on or near that frame's origin, which is also where the force
-    /// is applied to the part.
+    /// That frame's origin is where the canopy is attached to the part. The lines meet
+    /// there too, or further out along the axis with a riser between.
     /// </summary>
     public sealed class CanopyShape
     {
@@ -17,8 +17,18 @@ namespace ParaSoft.Core
         public Vec3 Axis;
         /// <summary>Two unit vectors completing a right-handed basis with Axis.</summary>
         public Vec3 E1, E2;
-        /// <summary>Where the suspension lines meet.</summary>
+        /// <summary>Where the suspension lines meet: the origin, or the top of the riser.</summary>
         public Vec3 Confluence;
+
+        /// <summary>Length of the riser from the part to the confluence; 0 if the lines meet at the part.</summary>
+        public float RiserLength { get { return Confluence.Length; } }
+
+        /// <summary>
+        /// Where a cluster's risers join, if they share a strap from the part before
+        /// splitting to their own confluences (ReStock's Mk16-XL, Boring Crew Services'
+        /// swivel). Zero when each riser runs straight from the part.
+        /// </summary>
+        public Vec3 RiserJunction;
         /// <summary>Radius of the hem, where the lines attach.</summary>
         public float HemRadius;
         /// <summary>Distance of the hem plane from the frame origin along Axis.</summary>
@@ -162,6 +172,12 @@ namespace ParaSoft.Core
         public readonly List<CanopyShape> Canopies = new List<CanopyShape>();
         /// <summary>For every input vertex, the canopy it belongs to.</summary>
         public int[] VertexCanopy;
+        /// <summary>
+        /// True for a cluster whose canopies' lines all meet at one point (RealChute's triple
+        /// chute): the solver then keeps their confluences together rather than letting each
+        /// canopy take its own.
+        /// </summary>
+        public bool SharedConfluence;
         /// <summary>Null on success, otherwise why the model could not be read as round canopies.</summary>
         public string Failure;
 
@@ -174,11 +190,12 @@ namespace ParaSoft.Core
     /// Parachute models do not say which of their vertices are fabric and which are lines,
     /// where the hem is, or even how many canopies they contain - ReStock's Mk16-XL is three
     /// skinned canopies under one transform, RealChute's "Triple chute" is three in one mesh.
-    /// So the fitter works from geometry alone: lines converge on the frame origin and the
-    /// fabric sits far out, so the far vertices are fabric; k-means on those finds the
-    /// canopies; each canopy's centroid gives its axis; and a polar profile about a point
-    /// just below the hem describes the dome whether it is flat, hemispherical or conical.
-    /// A cluster count is accepted only if every canopy it produces is round.
+    /// So the fitter works from geometry alone: the fabric sits far out from the part, so the
+    /// far vertices are fabric; k-means on those finds the canopies; each canopy's centroid
+    /// gives its axis; a polar profile about a point just below the hem describes the dome
+    /// whether it is flat, hemispherical or conical; and the cone of lines below the hem,
+    /// extended to the axis, says where they meet. A cluster count is accepted only if every
+    /// canopy it produces is round.
     /// </summary>
     public static class CanopyFitter
     {
@@ -254,6 +271,8 @@ namespace ParaSoft.Core
                 {
                     result.Canopies.AddRange(shapes);
                     result.VertexCanopy = assignment;
+                    result.SharedConfluence = ShareConfluence(result.Canopies);
+                    if (!result.SharedConfluence) FindJunction(vertices, assignment, result.Canopies);
                     return result;
                 }
                 if (score < bestScore)
@@ -268,6 +287,8 @@ namespace ParaSoft.Core
             {
                 result.Canopies.AddRange(bestShapes);
                 result.VertexCanopy = bestAssignment;
+                result.SharedConfluence = ShareConfluence(result.Canopies);
+                if (!result.SharedConfluence) FindJunction(vertices, bestAssignment, result.Canopies);
                 return result;
             }
             result.Failure = lastFailure;
@@ -595,16 +616,7 @@ namespace ParaSoft.Core
                 return null;
             }
 
-            // Lines converge on the origin in every model inspected; where they meet
-            // further up, keep that as a riser.
-            var confluence = Vec3.Zero;
-            if (lines.Count >= 8)
-            {
-                var lh = new List<float>();
-                foreach (var i in lines) lh.Add(Vec3.Dot(v[i], axis));
-                var low = Percentile(lh, 0.02f);
-                if (low > 0.05f * hemH) confluence = axis * low;
-            }
+            var confluence = FindConfluence(v, lines, axis, e1, e2, hemR, hemH);
 
             return new CanopyShape
             {
@@ -620,6 +632,202 @@ namespace ParaSoft.Core
                 RmsError = rms,
                 Vertices = members.Count
             };
+        }
+
+        /// <summary>
+        /// Where the suspension lines meet. Few models bring them right to the part: most
+        /// gather them a few metres out and hang that point from the part on a riser (stock
+        /// Mk16 and Mk25, RealChute, ReStock; Boring Crew Services' Starliner chutes have
+        /// 5-8 m of shock cord), and in a cluster the meeting point is often shared, off to
+        /// one side of each canopy's own axis. The lowest line vertex cannot tell any of that
+        /// apart - the riser is below the lines too.
+        ///
+        /// So each line vertex is taken to lie on a straight line from the hem, and the point
+        /// nearest all those lines is found by least squares. A first guess comes from
+        /// extending every vertex down its line to the axis and taking the median; then the
+        /// point is refined in 3D, working out for each vertex which hem point its line comes
+        /// from by following the ray from the current guess out through it, and ignoring
+        /// the riser below and anything that does not fit. Lines modelled with vertices all
+        /// along them and lines modelled with vertices only at their ends both work.
+        /// </summary>
+        private static Vec3 FindConfluence(Vec3[] v, List<int> lines, Vec3 axis, Vec3 e1, Vec3 e2, float hemR, float hemH)
+        {
+            if (lines.Count < 8 || hemR <= 1e-4f) return Vec3.Zero;
+
+            // First guess, on the axis.
+            var apex = new List<float>();
+            foreach (var i in lines)
+            {
+                var h = Vec3.Dot(v[i], axis);
+                var rho = Vec3.Reject(v[i], axis).Length;
+                // Not the hem, where the extension is ill-conditioned.
+                if (rho > 0.9f * hemR || h >= hemH) continue;
+                apex.Add(hemH - hemR * (hemH - h) / (hemR - rho));
+            }
+            if (apex.Count < 8) return Vec3.Zero;
+            var c = axis * MathX.Clamp(Percentile(apex, 0.5f), 0f, 0.8f * hemH);
+
+            // Refine in 3D.
+            var cand = new List<int>();
+            var hs = new List<Vec3>();
+            var ds = new List<Vec3>();
+            var weight = new List<float>();
+            var resid = new List<float>();
+            for (var iter = 0; iter < 6; iter++)
+            {
+                var ch = Vec3.Dot(c, axis);
+                var down = c.Length > 0.01f * hemH ? c.Normalized : axis;
+                cand.Clear();
+                hs.Clear();
+                ds.Clear();
+                foreach (var i in lines)
+                {
+                    var p = v[i];
+                    var h = Vec3.Dot(p, axis);
+                    // Lines only: not the riser on the part's side of the meeting point, not the hem.
+                    if (Vec3.Dot(p - c, down) < -0.02f * hemH || h >= hemH || Vec3.Reject(p, axis).Length > 0.9f * hemR) continue;
+                    // Which hem point this vertex's line comes from: follow the ray from the
+                    // current guess out through the vertex to the hem's plane. Right at the
+                    // meeting point that direction means nothing, but any line through the
+                    // vertex then passes through the meeting point anyway.
+                    var ray = p - c;
+                    var rise = Vec3.Dot(ray, axis);
+                    var onHem = ray.Length > 0.02f * hemR && rise > 1e-4f ? c + ray * ((hemH - ch) / rise) : p;
+                    var th = (float)Math.Atan2(Vec3.Dot(onHem, e2), Vec3.Dot(onHem, e1));
+                    var hemPoint = axis * hemH + (e1 * (float)Math.Cos(th) + e2 * (float)Math.Sin(th)) * hemR;
+                    var d = p - hemPoint;
+                    var dl = d.Length;
+                    if (dl < 0.05f * hemR) continue;
+                    cand.Add(i);
+                    hs.Add(hemPoint);
+                    ds.Add(d / dl);
+                }
+                if (cand.Count < 8) break;
+
+                // Trim: after the first pass, lines that miss the point by far more than most do
+                // are fittings, the riser, or another canopy's lines.
+                weight.Clear();
+                resid.Clear();
+                for (var k = 0; k < cand.Count; k++) resid.Add(DistToLine(c, hs[k], ds[k]));
+                var cut = iter == 0 ? float.MaxValue : Math.Max(3f * Percentile(resid, 0.5f), 0.01f * hemR);
+                for (var k = 0; k < cand.Count; k++) weight.Add(resid[k] <= cut ? 1f : 0f);
+
+                Vec3 next;
+                if (!NearestToLines(hs, ds, weight, out next)) break;
+                var nh = Vec3.Dot(next, axis);
+                if (nh < -0.1f * hemH || nh > 0.8f * hemH) break;
+                var moved = Vec3.Distance(next, c);
+                c = next;
+                if (moved < 1e-4f * hemR) break;
+            }
+
+            // A riser shorter than this is the lines' own taper at the part: call it none.
+            return c.Length > 0.05f * hemH ? c : Vec3.Zero;
+        }
+
+        /// <summary>
+        /// Whether a cluster's canopies meet at one point, rather than each at its own on
+        /// its own riser. If so, they are all given exactly that point.
+        /// </summary>
+        private static bool ShareConfluence(List<CanopyShape> shapes)
+        {
+            if (shapes.Count < 2) return false;
+            var mean = Vec3.Zero;
+            var r = float.MaxValue;
+            foreach (var s in shapes)
+            {
+                mean += s.Confluence;
+                r = Math.Min(r, s.MaxRadius);
+            }
+            mean = mean / shapes.Count;
+            foreach (var s in shapes)
+                if (Vec3.Distance(s.Confluence, mean) > 0.1f * r) return false;
+            foreach (var s in shapes) s.Confluence = mean;
+            return true;
+        }
+
+        /// <summary>
+        /// For a cluster with a riser per canopy, how far out from the part they share one
+        /// strap before splitting. Near the part a vertex on the shared strap sits on the
+        /// cluster's mean line; one on a canopy's own riser sits on that. The junction is as
+        /// far out as vertices keep hugging the mean line.
+        /// </summary>
+        private static void FindJunction(Vec3[] v, int[] assignment, List<CanopyShape> shapes)
+        {
+            if (shapes.Count < 2) return;
+            var sum = Vec3.Zero;
+            var shortest = float.MaxValue;
+            var r = float.MaxValue;
+            foreach (var s in shapes)
+            {
+                sum += s.Confluence;
+                shortest = Math.Min(shortest, s.RiserLength);
+                r = Math.Min(r, s.MaxRadius);
+            }
+            if (shortest < 0.05f * r || sum.Length < 1e-4f) return;
+            var dir = sum.Normalized;
+
+            var along = new List<float>();
+            for (var i = 0; i < v.Length; i++)
+            {
+                var s = shapes[assignment[i]];
+                var h = Vec3.Dot(v[i], dir);
+                if (h <= 0f || h > 0.9f * shortest) continue;
+                var onMean = Vec3.Reject(v[i], dir).Length;
+                if (onMean > 0.1f * r) continue;
+                var c = s.Confluence;
+                var t = MathX.Clamp01(Vec3.Dot(v[i], c) / c.SqrLength);
+                var onOwn = Vec3.Distance(v[i], c * t);
+                if (onMean * 2f < onOwn) along.Add(h);
+            }
+            if (along.Count < 4) return;
+            var hj = Percentile(along, 0.95f);
+            if (hj < 0.05f * shortest) return;
+            foreach (var s in shapes) s.RiserJunction = dir * hj;
+        }
+
+        private static float DistToLine(Vec3 p, Vec3 a, Vec3 dir)
+        {
+            return Vec3.Reject(p - a, dir).Length;
+        }
+
+        /// <summary>Least-squares point nearest a set of weighted lines (point, unit direction).</summary>
+        private static bool NearestToLines(List<Vec3> points, List<Vec3> dirs, List<float> weights, out Vec3 result)
+        {
+            // Sum over lines of w (I - d d^T), and of w (I - d d^T) a.
+            double a00 = 0, a01 = 0, a02 = 0, a11 = 0, a12 = 0, a22 = 0, b0 = 0, b1 = 0, b2 = 0;
+            for (var k = 0; k < points.Count; k++)
+            {
+                var w = weights[k];
+                if (w <= 0f) continue;
+                var d = dirs[k];
+                var p = points[k];
+                double m00 = 1 - d.X * d.X, m01 = -d.X * d.Y, m02 = -d.X * d.Z;
+                double m11 = 1 - d.Y * d.Y, m12 = -d.Y * d.Z, m22 = 1 - d.Z * d.Z;
+                a00 += w * m00; a01 += w * m01; a02 += w * m02;
+                a11 += w * m11; a12 += w * m12; a22 += w * m22;
+                b0 += w * (m00 * p.X + m01 * p.Y + m02 * p.Z);
+                b1 += w * (m01 * p.X + m11 * p.Y + m12 * p.Z);
+                b2 += w * (m02 * p.X + m12 * p.Y + m22 * p.Z);
+            }
+            // Solve the symmetric 3x3 by Cramer's rule.
+            var c00 = a11 * a22 - a12 * a12;
+            var c01 = a02 * a12 - a01 * a22;
+            var c02 = a01 * a12 - a02 * a11;
+            var det = a00 * c00 + a01 * c01 + a02 * c02;
+            if (Math.Abs(det) < 1e-9)
+            {
+                result = Vec3.Zero;
+                return false;
+            }
+            var c11 = a00 * a22 - a02 * a02;
+            var c12 = a01 * a02 - a00 * a12;
+            var c22 = a00 * a11 - a01 * a01;
+            result = new Vec3(
+                (float)((c00 * b0 + c01 * b1 + c02 * b2) / det),
+                (float)((c01 * b0 + c11 * b1 + c12 * b2) / det),
+                (float)((c02 * b0 + c12 * b1 + c22 * b2) / det));
+            return result.IsFinite;
         }
 
         /// <summary>Resamples a 2D polyline to evenly spaced arc-length points.</summary>

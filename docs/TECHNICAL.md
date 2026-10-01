@@ -68,8 +68,8 @@ shares one fit.
 `CanopyFitter` works from geometry alone, because models do not label which vertices are
 fabric and which are lines, where the hem is, or even how many canopies they contain.
 
-- **Fabric vs lines.** Lines converge on the canopy transform's origin, fabric sits far
-  out, so vertices beyond 45% of the farthest distance are fabric.
+- **Fabric vs lines.** Lines and risers converge towards the canopy transform's origin,
+  fabric sits far out, so vertices beyond 45% of the farthest distance are fabric.
 - **How many canopies.** K-means (farthest-point seeded) on the fabric vertices, for
   k = 1..7, or the count RealChute reports for its model. A count is accepted only if every
   canopy it produces is convincingly round: sector-radius ratio under 1.12 and fit error
@@ -87,6 +87,23 @@ fabric and which are lines, where the hem is, or even how many canopies they con
   evenly spaced by arc length from the vent edge to the hem.
 - **Vent.** An open crown keeps its real vent. A closed crown gets a vent of 4% of the
   radius, because the lattice needs a ring to hang from - and every real canopy has one.
+- **Where the lines meet.** Few models bring the lines right to the part. Most gather them
+  a few metres out and hang that point from the part on a riser: 2.3 m on the stock Mk16,
+  4-5 m on RealChute's and ReStock's, 5-8 m on Boring Crew Services' Starliner chutes,
+  9.7 m on Custom Parachute Message's canopy. In a cluster the meeting point is off each
+  canopy's own axis. The lowest line vertex says nothing, because the riser is lower still.
+  So every line vertex is taken to lie on a straight line from the hem, and the point
+  nearest all of those lines is found by least squares. A first guess comes from extending
+  each vertex down its line to the axis and taking the median. It is then refined in 3D:
+  for each vertex, the ray from the current guess out through it says which hem point its
+  line comes from, the riser and fittings on the part's side are excluded, and outliers
+  are trimmed. This works whether a line is modelled with vertices all along it or only
+  at its two ends, as the Starliner's are.
+- **Shared risers.** If a cluster's canopies meet at one point (within a tenth of a
+  radius), they are given exactly that point and the solver keeps their confluences
+  together. If each has its own riser but the risers share a strap from the part (ReStock's
+  Mk16-XL and Mk25 join theirs 1.4 m out, the Starliner at its swivel 0.7 m out), the
+  junction is where vertices stop hugging the cluster's mean line.
 
 Models that are not round (the stock EVA parafoil, rectangular mod canopies) fail the
 roundness test and simply keep their module's own animation.
@@ -119,6 +136,10 @@ Constraints, all distance constraints:
 Fabric and cord only ever pull. Everything else about the canopy's shape comes from the
 air pressure on it, which is what makes it collapse when the air stops.
 
+The riser is not cloth. It is a strap that the canopy's pull holds straight, so the
+confluence is simply kept within the riser's length of the anchor. Once cut, the riser
+trails loose below the confluence.
+
 ## Embedding: making the original mesh follow
 
 The player sees the part's own canopy mesh, not the lattice. `CanopyEmbedding` ties each
@@ -129,12 +150,24 @@ of its vertices to the lattice:
   offset from the bilinearly interpolated lattice surface in that spot's local frame
   (hoop direction, meridian direction, normal);
 - a **line** vertex by how far it is down the lines and which two lines it sits between.
+  Which lines is found by following the ray from the confluence out through the vertex to
+  the hem, since the confluence need not be on the axis;
+- a **riser** vertex by how far it is along the riser. That riser runs from the part (or
+  where a cut riser trails to), through the cluster's shared junction if there is one, to
+  the confluence. The junction lies out along the canopies' combined pull.
 
 Normals and tangents are stored in the same local frames. Evaluating on the rest lattice
 reproduces the model to about a ten-millionth of the canopy radius, and moving the whole
 lattice rigidly moves every vertex rigidly - both checked on every model in the install.
 Because offsets live in local frames, seams, scallops, double-sided fabric and lines
 modelled as thin tubes all keep their shape as the canopy moves.
+
+That only holds if each cord vertex was matched to a cord that is really where it is.
+A line vertex half a metre from its lattice line is carried half a metre off in whatever
+direction that line's frame turns, and a thin cord becomes a ribbon. So the model report
+also checks how far each line and riser vertex sits from its cord: under 14 cm for lines
+and 6 cm for risers in every model tested. In 1.0, which assumed the lines met at the
+part, it was up to 2 m.
 
 ## The cloth solver
 
@@ -184,7 +217,8 @@ direction relative to the triangle and `s = n . w` (positive when air strikes th
 external   Cout = -Cbase                              if s >= 0 (leeward, in the wake)
                   -Cbase + (Cw + Cbase) s^2           if s <  0 (outer face windward)
 flat plate Cn   = Cflat s |s|
-dp = fill x q_inf x (Cin - Cout)  +  (1 - fill) x q_local x Cn
+plate      = 1 - fill / (1 - porosity)                (0 once the canopy is full)
+dp = fill x q_inf x (Cin - Cout)  +  plate x q_local x Cn
 ```
 
 `Cin = 1` (stagnation), `Cbase = 0.4` (wake suction), `Cw = 1`, `Cflat = 1.2`. A fully
@@ -192,6 +226,23 @@ inflated hemisphere facing the flow gets a uniform 1.4 q across it - a drag coef
 1.4 on projected area, which is what real hemispherical canopies measure. A limp canopy
 streaming in the flow gets only flat-plate forces, and flutters. Skin friction
 (`Cf = 0.015`) acts along the fabric, and lines get cylinder crossflow drag.
+
+The plate term fades out as the canopy fills. In 1.0 it was weighted `1 - fill`, which left
+8% of it on a full canopy. On a small, light canopy at speed that made the panels flutter
+and rectified into a steady sideways force: a 4 m drogue on 13 m of line at 42 m/s glided
+off 30 degrees to one side and stayed there.
+
+**Stability.** Pressure on the cloth acts along each panel's normal, so on a full canopy it
+adds up to a pull along the canopy's own axis, whichever way the air meets it. Nothing
+then turns the canopy back into the wind, and nothing damps its swinging: it drifts and
+swings like a solid canopy with no vent. Real round canopies with a vent and porous cloth
+pull almost straight along the relative wind. So every substep the net pressure force on
+the fabric is compared with the same force pointed along the air the canopy actually
+meets, which includes its own sideways motion. `stability` (0.8) of the difference is
+spread over the fabric by area. A canopy swinging sideways meets the air at an angle and is
+pulled back. Across radii of 2-9 m, lines of 2.4-6 radii and speeds of 7-150 m/s, an open
+canopy started 20 degrees out settles within 1-2 degrees of the flow; a big canopy at a
+slow descent still sways a few degrees in gusts, as real ones do.
 
 **Fill** is the fraction of stagnation pressure inside the canopy. It rises towards
 
@@ -222,8 +273,10 @@ still packed, dragged by the pilot chute (2% of the canopy's drag area, half as 
 while the bag is on).
 
 Every particle has a **payout distance**: how far along the structure from the confluence
-it is, summed from the actual segment lengths. Lines come out first, then the hem, then
-each ring to the crown, each let go when the bag is far enough away to have pulled it out.
+it is, summed from the actual segment lengths. The riser comes out first, then the lines,
+then the hem, then each ring to the crown, each let go when the bag is far enough away to
+have pulled it out. A cluster's canopies leave in their own bags, fanned out as the
+model spreads them, so they do not open inside one another.
 Everything already out lies straight behind the bag, as lines under extraction tension do,
 with the gores spread a little around the pull so the streamer has a mouth for air to
 find. The layout places every seam and line segment at exactly its rest length, so nothing
@@ -249,10 +302,14 @@ second.
 ### Cutting
 
 When the module cuts the canopy, it is handed to the flight scene's system as debris: the
-lines let go of the part and the canopy flies on by itself for the configured time. With
-no anchor, its frame's origin is kept relative to the planet's centre - which floating
-origin and Krakensbane move along with everything else - and its velocity follows the
-canopy's, re-centring if it drifts. A part destroyed with its canopy out does the same.
+riser lets go of the part and the canopy flies on by itself. With no anchor, its frame's
+origin is kept relative to the planet's centre - which floating origin and Krakensbane
+move along with everything else - and its velocity follows the canopy's, re-centring if
+it drifts. A part destroyed with its canopy out does the same.
+
+A cut canopy is removed at the first of: `cutCanopyRange` (750 m) from both the camera and
+the active craft; 15 seconds lying still (under 1 m/s, empty) on the ground or the sea; or
+the "Cut canopies linger" time (30 s).
 
 ## Environment
 
@@ -260,8 +317,8 @@ Every physics frame, per canopy:
 
 | Quantity | Source |
 |---|---|
-| Anchor velocity | the part's rigidbody point velocity (its parent's, for physicsless parts) + Krakensbane frame velocity |
-| Air velocity | zero in KSP's rotating frame, the surface's rotation velocity when it is inertial, plus wind |
+| Anchor velocity | the part's rigidbody point velocity (its parent's, for physicsless parts) + Krakensbane frame velocity, smoothed over 50 ms so a light part ringing on its joint does not buzz through the lines |
+| Air velocity | zero in KSP's rotating frame, the surface's rotation velocity when it is inertial, plus the craft's share of the wind (below) |
 | Wind | Kerbal Weather Project's world-space wind vector (`KerbalWxClimo`/`KerbalWxPoint.windVectorWS`, whichever mode is on) - the same vector KWP subtracts from part velocities in its own aerodynamics; otherwise any wind function registered with FAR's `FARAtmosphere.GetWind` |
 | Density | the part's `atmDensity`, else the vessel's |
 | Speed of sound | the vessel's |
@@ -269,6 +326,27 @@ Every physics frame, per canopy:
 
 The fictitious forces of KSP's rotating frame act on the craft and canopy alike and are
 left out: they would only shift the canopy relative to the craft by millimetres.
+
+### How much of the wind
+
+A canopy's lines point the way it pulls the craft. ParaSoft never pulls the craft, so the
+canopy must agree with the drag the parachute module applies, and wind is where the two
+can disagree. FAR applies the whole wind to every part. Kerbal Weather Project in stock
+aerodynamics adds a wind correction per part but limits it by the part's mass, so a
+parachute - a 20 kg part carrying the craft's whole weight - gets only a few percent of
+it. RealChute computes its drag with no wind at all. A canopy that felt the whole wind
+regardless would lean 50 degrees downwind above a craft whose parachute drag points
+straight up.
+
+So `CraftFlow` watches each craft. Its centre-of-mass acceleration, less gravity, the
+rotating frame's fictitious accelerations and engine thrust, smoothed over 0.3 s, is what
+the air is doing to it. The air must be blowing past the craft opposite to that push.
+`WindResponse` finds the share `f` of the wind for which `velocity - f x wind` best lines
+up against it, by least squares on the part across the push, clamped to 0..1. That share
+is what its canopies are given: 1 under FAR, near 0 with RealChute, in between in stock
+with KWP. It is trusted only while the air is clearly doing the pushing (at least 0.15 g
+of it, and not on the ground); otherwise it relaxes back to the whole wind. So a landed
+canopy on the ground feels the real wind, and so does a cut canopy, which is free.
 
 This is what makes the same canopy behave differently on different worlds. Nothing is
 special-cased per planet: on Duna the dynamic pressure at a given speed is a sixtieth of
@@ -299,8 +377,25 @@ own motion. Water is soft: fabric below the surface is carried a third of the wa
 each substep and dragged hard towards the water's motion, so it floats low and rides the
 waves.
 
-Canopies also push each other: each inflated canopy is a sphere to the others, and fabric
-inside another's sphere is pushed out. That is what spreads a cluster.
+**Canopies against canopies.** Once a frame, before anything steps, every open canopy's
+contact volume is gathered in world space. That volume is a capsule from the hem's centre
+towards the crown, 0.95 times as wide as the widest ring: nearly a sphere for an open
+canopy, long and thin for a streamer. Each canopy is then given the others near it,
+moved into its own frame: its cluster-mates, the craft's other chutes, other craft's, and
+cut canopies drifting past. Two things follow:
+
+- fabric that strays into another canopy's volume is pushed out every substep, with light
+  friction - but only if the push dents it back towards its own canopy. Where two canopies
+  overlap deeply, pushing the far side of one out of the other would drape it round the
+  other and hold them together;
+- a canopy crowding another (their volumes within 1.1 times their combined radii) is
+  pushed away from it across the flow, 2.5 times its drag area times dynamic pressure
+  at full overlap, spread over its fabric. That is the air squeezed out between cluster
+  canopies, and it is what spreads a cluster: three canopies released from the same bag
+  end up about 20 degrees apart, just touching.
+
+A cluster whose lines meet at one point has its confluences put back together after each
+step, where the pulls balance.
 
 None of this pushes back. A canopy draping over a lander does not move the lander.
 
@@ -353,7 +448,7 @@ Measured by `Tools/Test.ps1` on .NET Framework (KSP's Mono is somewhat slower):
 
 | | Low | Medium | High |
 |---|---|---|---|
-| Solver, per canopy per physics frame | 0.13 ms | 0.29 ms | 0.53 ms |
+| Solver, per canopy per physics frame | 0.14 ms | 0.32 ms | 0.56 ms |
 
 Moving a 10,000-vertex canopy mesh (ReStock's Mk16-XL is 9,360) costs about 1.2 ms, paid
 only when the simulation has actually stepped - physics is 50 Hz, rendering usually
@@ -371,28 +466,40 @@ any more deploy with their module's own animation.
 **Solver behaviour** (`Tools/Tests.cs`, also run by CI): steady descent inflates with the
 crown above the craft; a pack deployment is fully out in under half a second and 92% full;
 vacuum never fills; Duna still fills at speed; a 10 m/s crosswind on a 7 m/s descent leans
-the canopy about 53 degrees downwind, as the relative wind predicts; reefing holds the hem
+the canopy about 56 degrees downwind, as the relative wind predicts; reefing holds the hem
 to under 3% of its area and disreefing opens it; a landed canopy lies flat and empties;
 fabric floats on waves; an obstacle is flowed around; a cut canopy flies away; Mach 1.9 and
 a 250 m/s sea-level opening need no recoveries; a sudden change in the craft's velocity
 drags the canopy rather than teleporting it; embedded mesh vertices stay on the simulated
-canopy; and the timings above.
+canopy; a small drogue on long lines at 42 m/s stays within 5 degrees of the flow (it
+glided off 30 in 1.0); a canopy swung 20 degrees out comes back; three canopies released
+from one bag spread apart without overlapping; a riser pays out first and then holds the
+confluence at its length; the fitter finds a riser, and a cluster's shared strap, in
+models built with lines drawn only at their ends; the wind share comes out right for
+crafts feeling none, some and all of the wind; and the timings above.
 
 **Real models** (`Tools/ModelReport.cs`, with a KSP install): reads each parachute model
 with a small `.mu` reader (`Tools/MuModel.cs`), plays its deploy clips, skins and bakes
 it, fits it, builds the lattice, embeds every vertex, and checks that the embedding
-reproduces the model at rest and moves it rigidly with a rigid lattice. From the
-development install:
+reproduces the model at rest, moves it rigidly with a rigid lattice, and puts every line
+and riser vertex on its cord. From the development install:
 
-| Model | Canopies | Vertices | Fit error | Symmetry |
-|---|---|---|---|---|
-| Stock Mk16, Mk2-R, Mk25, Mk12-R, Mk16-XL | 1 | 532-728 | 1.0-1.1% | 1.02-1.04 |
-| RealChute single (both) | 1 | 1,209 | 1.0% | 1.02 |
-| RealChute triple (both) | 3 | 3,619 | 1.1% | 1.02-1.03 |
-| ReStock Mk16, Mk2-R, Mk12-R | 1 | 2,604-3,084 | 0.5-0.6% | 1.00 |
-| ReStock Mk16-XL | 3 | 9,360 | 1.0% | 1.02-1.03 |
-| ReStock Mk25 | 2 | 5,316 | 0.8% | 1.02 |
-| Custom Parachute Message "Encoded" | 1 | 1,499 | 0.4% | 1.01 |
+| Model | Canopies | Vertices | Fit error | Symmetry | Riser | Cord offset (line / riser) |
+|---|---|---|---|---|---|---|
+| Stock Mk16 | 1 | 532 | 1.0% | 1.02 | 2.25 m | 0.00 / 0.06 m |
+| Stock Mk2-R, Mk12-R, Mk16-XL | 1 | 720 | 1.0% | 1.03 | none | 0.01 / - m |
+| Stock Mk25 | 1 | 728 | 1.1% | 1.04 | 4.3 m | 0.01 / 0.01 m |
+| RealChute single (both) | 1 | 1,209 | 1.0% | 1.02 | 4.95 m | 0.01 / 0.01 m |
+| RealChute triple (both) | 3 | 3,619 | 1.1% | 1.02-1.03 | 4.3 m each | 0.01 / 0.01 m |
+| ReStock Mk16, Mk2-R, Mk12-R | 1 | 2,604-3,084 | 0.5-0.6% | 1.00 | 4.7 m | 0.01-0.04 / 0.03 m |
+| ReStock Mk16-XL | 3 | 9,360 | 1.0% | 1.02-1.03 | 5.5 m, joined at 1.4 m | 0.10 / 0.03 m |
+| ReStock Mk25 | 2 | 5,316 | 0.8% | 1.02 | 5.6 m, joined at 1.4 m | 0.08 / 0.03 m |
+| Custom Parachute Message "Encoded" | 1 | 1,499 | 0.4% | 1.01 | 9.7 m | 0.04 / 0.05 m |
+| Boring Crew Services Starliner main | 3 | 33,719 | 0.7% | 1.00 | 8.1 m, joined at 0.7 m | 0.14 / 0.05 m |
+| Boring Crew Services Starliner drogue | 2 | 5,928 | 0.7% | 1.00 | 5.35 m | 0.02 / 0.01 m |
+
+The Starliner models are fitted when Boring Crew Services is installed; their lines are
+modelled with vertices only at their two ends, the case the 3D confluence search exists for.
 
 Side views of every fit land in `build/fits/`.
 
@@ -409,4 +516,10 @@ and the README come from it, as does the stock Mk16 mesh deformed in a crosswind
   them turns it off (with a line in the log) rather than breaking anything.
 - Kerbal Weather Project computes one wind vector for the active vessel's location;
   canopies on other vessels in physics range see the same wind, exactly as KWP's own
-  aerodynamics do.
+  aerodynamics do (and as KWP applies no wind to those vessels, their share comes out
+  near none).
+- Risers are straight straps, not cloth: a slack riser shortens rather than sags.
+- The wind share is worked out from the craft's whole acceleration, less gravity and
+  engine thrust. RCS thrust, collisions and lift from the craft's own body are not
+  separated out. They can only move the share between none and all of the wind, and the
+  share is only trusted while the air clearly dominates.

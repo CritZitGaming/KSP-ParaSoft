@@ -35,6 +35,8 @@ namespace ParaSoft
         private int lodCounter;
         private float deployedFor;
         private bool disposed;
+        private Vector3 frameVelocity;     // the anchor's, Unity + Krakensbane, lightly smoothed
+        private bool haveFrameVelocity;
 
         internal CanopyController(Part part, ChuteHost host, ChuteSlot slot)
         {
@@ -46,6 +48,8 @@ namespace ParaSoft
         internal bool Active { get { return sims != null; } }
         internal CanopySim[] Sims { get { return sims; } }
         internal bool Disposed { get { return disposed; } }
+        /// <summary>Velocity of the canopies' frame (the anchor), Unity + Krakensbane.</summary>
+        internal Vector3 FrameVelocity { get { return frameVelocity; } }
 
         internal Vector3 Anchor
         {
@@ -124,6 +128,10 @@ namespace ParaSoft
             if (state == HostState.Stowed) seenStowed = true;
             lastState = state;
 
+            // Keep up with how the craft moves even while packed, so a canopy that opens
+            // already knows how much of the wind the craft is feeling.
+            var flow = system.FlowFor(Part.vessel);
+
             if (sims == null) return;
 
             var vessel = Part.vessel;
@@ -143,6 +151,7 @@ namespace ParaSoft
             if (frozen)
             {
                 frozen = false;
+                haveFrameVelocity = false;
                 foreach (var s in sims) s.ResetFrame();
             }
             // Beyond the LOD distance, step every other frame with twice the time step.
@@ -161,30 +170,52 @@ namespace ParaSoft
             var reef = Mathf.Sqrt(Mathf.Clamp01(open));
             if (state == HostState.Semi) reef = Mathf.Max(reef, 0.05f);
 
-            var env = BuildEnvironment(anchor, vessel);
+            TrackFrameVelocity(anchor, vessel, stepDt);
+            var env = BuildEnvironment(anchor, vessel, flow);
             UpdateSurroundings(anchor, env, stepDt, vessel);
+            var origin = anchor.ToVec3();
+            var originVelocity = frameVelocity.ToVec3();
             foreach (var s in sims)
             {
                 s.SetReefTarget(reef);
+                system.Contacts.Fill(s, origin, originVelocity);
                 s.Step(stepDt, env, surroundings.World);
             }
+            if (model.Fit.SharedConfluence) CanopySim.TieConfluences(sims);
         }
 
-        private SimEnvironment BuildEnvironment(Vector3 anchor, Vessel vessel)
+        /// <summary>
+        /// The anchor's velocity. A parachute is a light part on a joint and rings with the
+        /// craft's vibration; the lines would pass that on to the canopy as a buzz no real
+        /// cord would carry, so it is smoothed over a few frames.
+        /// </summary>
+        private void TrackFrameVelocity(Vector3 anchor, Vessel vessel, float dt)
         {
-            var body = vessel.mainBody;
             // Physicsless parts ride on their parent's rigidbody.
             Rigidbody rb = null;
             for (var p = Part; p != null && rb == null; p = p.parent) rb = p.Rigidbody;
-            var kb = Krakensbane.GetFrameVelocityV3f();
-            var frameVel = (rb != null ? rb.GetPointVelocity(anchor) : vessel.rb_velocity) + kb;
+            var raw = (rb != null ? rb.GetPointVelocity(anchor) : vessel.rb_velocity) + Krakensbane.GetFrameVelocityV3f();
+            if (!haveFrameVelocity || dt <= 0f)
+            {
+                frameVelocity = raw;
+                haveFrameVelocity = true;
+                return;
+            }
+            frameVelocity += (raw - frameVelocity) * (1f - Mathf.Exp(-dt / 0.05f));
+        }
+
+        private SimEnvironment BuildEnvironment(Vector3 anchor, Vessel vessel, CraftFlow flow)
+        {
+            if (!haveFrameVelocity) TrackFrameVelocity(anchor, vessel, 0f);
+            var body = vessel.mainBody;
             var air = FlightGlobals.RefFrameIsRotating ? Vector3.zero : (Vector3)body.getRFrmVel(anchor);
-            var wind = Wind.At(body, Part, anchor);
+            // Only as much wind as is actually moving the craft; see CraftFlow.
+            var wind = Wind.At(body, Part, anchor) * (flow != null ? flow.WindFactor : 1f);
             air += wind;
             var density = (float)(Part.atmDensity > 0.0 ? Part.atmDensity : vessel.atmDensity);
             return new SimEnvironment
             {
-                FrameVelocity = frameVel.ToVec3(),
+                FrameVelocity = frameVelocity.ToVec3(),
                 AirVelocity = air.ToVec3(),
                 Gravity = ((Vector3)FlightGlobals.getGeeForceAtPosition(anchor)).ToVec3(),
                 Density = Mathf.Max(0f, density),
@@ -244,7 +275,8 @@ namespace ParaSoft
                 catch { areal = 0f; }
                 sims = new CanopySim[model.Lattices.Length];
                 var vessel = Part.vessel;
-                var env = BuildEnvironment(Anchor, vessel);
+                haveFrameVelocity = false;
+                var env = BuildEnvironment(Anchor, vessel, ParaSoftSystem.Instance != null ? ParaSoftSystem.Instance.FlowFor(vessel) : null);
                 var rel = env.FrameVelocity.ToVector3() - env.AirVelocity.ToVector3();
                 var canopy = SafeCanopy;
                 var up = (Anchor - (Vector3)vessel.mainBody.position).normalized;
@@ -256,15 +288,20 @@ namespace ParaSoft
                 foreach (var l in model.Lattices) mean += canopy.rotation * l.Shape.Axis.ToVector3();
                 mean = mean.normalized;
                 var toFlow = Quaternion.FromToRotation(mean, crown);
+                // A cluster's canopies leave in their own bags, fanned out the way the model
+                // spreads them, so they do not open inside one another.
+                var eject = fromPack ? EjectDirection(canopy) : crown;
+                var toEject = Quaternion.FromToRotation(mean, eject);
 
                 for (var c = 0; c < sims.Length; c++)
                 {
                     var s = new CanopySim(model.Lattices[c], Settings.NewParameters(areal), Part.GetInstanceID() * 31 + c);
-                    if (fromPack) s.BeginDeploy(EjectDirection(canopy).ToVec3());
+                    var own = canopy.rotation * model.Lattices[c].Shape.Axis.ToVector3();
+                    if (fromPack) s.BeginDeploy((sims.Length > 1 ? toEject * own : eject).ToVec3());
                     else
                     {
                         s.SetReefTarget(Mathf.Sqrt(Mathf.Clamp01(slot.OpenFraction)));
-                        s.InitialiseOpen((toFlow * (canopy.rotation * model.Lattices[c].Shape.Axis.ToVector3())).ToVec3());
+                        s.InitialiseOpen((toFlow * own).ToVec3());
                     }
                     sims[c] = s;
                 }
@@ -309,9 +346,9 @@ namespace ParaSoft
             var life = ParaSoftParameters.DetachedLifetime;
             if (life > 0f && sims != null && renderer != null && Part.vessel != null && !Part.vessel.packed)
             {
-                var env = BuildEnvironment(Anchor, Part.vessel);
+                if (!haveFrameVelocity) TrackFrameVelocity(Anchor, Part.vessel, 0f);
                 system.AdoptDetached(new DetachedCanopy(sims, renderer, Part.vessel.mainBody, Anchor,
-                    env.FrameVelocity.ToVector3(), life, Part.partInfo.title));
+                    frameVelocity, life, Part.partInfo.title, model.Fit.SharedConfluence));
                 renderer = null;   // now owned by the debris
                 sims = null;
                 surroundings = DisposeSurroundings();

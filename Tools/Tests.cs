@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using ParaSoft.Core;
 
 /// <summary>
@@ -35,6 +36,12 @@ internal static class Tests
         SurvivesAHardOpening();
         IgnoresFrameJumps();
         EmbeddingFollowsTheCanopy();
+        SmallDrogueHoldsTheFlow();
+        DampsItsSwing();
+        ClusterSpreadsApart();
+        RiserPaysOutAndHolds();
+        FindsRisersInModels();
+        WindOnlyAsMuchAsTheCraftFeels();
         IsCheapEnough();
 
         Console.WriteLine();
@@ -352,6 +359,221 @@ internal static class Tests
         }
         Check(emb.DomeCount == 300 && emb.LineCount == 100, "classified " + emb.DomeCount + " fabric / " + emb.LineCount + " line vertices");
         Check(far == 0, far + " vertices strayed from the canopy");
+    }
+
+    /// <summary>Angle, degrees, between where the canopy is and straight downstream of the anchor.</summary>
+    private static double OffFlow(CanopySim sim, Vec3 downstream)
+    {
+        var d = (sim.BubbleCentre - sim.Positions[sim.Lattice.ConfluenceIndex]).Normalized;
+        return Math.Acos(Math.Max(-1f, Math.Min(1f, Vec3.Dot(d, downstream.Normalized)))) * 180.0 / Math.PI;
+    }
+
+    private static CanopySim Tilted(CanopyShape shape, float degrees, int seed)
+    {
+        var sim = new CanopySim(CanopyLattice.Build(shape, LatticeResolution.Medium), new SimParameters(), seed);
+        var a = degrees * (float)Math.PI / 180f;
+        sim.InitialiseOpen(new Vec3((float)Math.Sin(a), (float)Math.Cos(a), 0f));
+        return sim;
+    }
+
+    private static void SmallDrogueHoldsTheFlow()
+    {
+        Begin("stability: a small drogue on long lines at 42 m/s trails straight, not gliding off");
+        // Starliner-drogue proportions. In 1.0 this settled 30 degrees off the flow.
+        var sim = Tilted(CanopyShape.Synthetic(2.1f, 0.7f, 6f), 20f, 21);
+        var env = Kerbin(Down * 42f);
+        env.Turbulence = 0.35f;
+        Run(sim, env, null, 4f);
+        double sum = 0, max = 0;
+        var n = 0;
+        for (var i = 0; i < 300; i++)
+        {
+            sim.Step(0.02f, env, null);
+            var a = OffFlow(sim, Up);
+            sum += a * a;
+            max = Math.Max(max, a);
+            n++;
+        }
+        Check(Math.Sqrt(sum / n) < 5.0, "RMS " + Math.Sqrt(sum / n).ToString("0.0") + " deg off the flow");
+        Check(max < 10.0, "at most " + max.ToString("0.0") + " deg off the flow");
+    }
+
+    private static void DampsItsSwing()
+    {
+        Begin("stability: a canopy swung 20 degrees out comes back and stays");
+        var sim = Tilted(CanopyShape.Synthetic(5f, 0.75f, 2.4f), 20f, 22);
+        var env = Kerbin(Down * 7f);
+        Run(sim, env, null, 8f);
+        var max = 0.0;
+        for (var i = 0; i < 200; i++)
+        {
+            sim.Step(0.02f, env, null);
+            max = Math.Max(max, OffFlow(sim, Up));
+        }
+        Check(max < 5.0, "within " + max.ToString("0.0") + " deg of the flow after 8 s");
+    }
+
+    private static void ClusterSpreadsApart()
+    {
+        Begin("cluster: three canopies out of one bag spread apart instead of opening inside each other");
+        var shape = CanopyShape.Synthetic(5f, 0.75f, 3f);
+        var sims = new CanopySim[3];
+        for (var i = 0; i < 3; i++)
+        {
+            sims[i] = new CanopySim(CanopyLattice.Build(shape, LatticeResolution.Medium), new SimParameters(), 30 + i);
+            sims[i].BeginDeploy(Up); // the worst case: all in the same place
+        }
+        var contacts = new CanopyContacts();
+        var env = Kerbin(Down * 42f);
+        for (var step = 0; step < 500; step++)
+        {
+            contacts.Clear();
+            foreach (var s in sims) contacts.Add(s, Vec3.Zero, env.FrameVelocity);
+            foreach (var s in sims)
+            {
+                contacts.Fill(s, Vec3.Zero, env.FrameVelocity);
+                s.Step(0.02f, env, null);
+            }
+        }
+        var worst = float.MinValue;
+        for (var i = 0; i < 3; i++)
+            for (var j = i + 1; j < 3; j++)
+            {
+                Vec3 a1, b1, a2, b2, p1, p2;
+                float r1, r2;
+                sims[i].ContactCapsule(out a1, out b1, out r1);
+                sims[j].ContactCapsule(out a2, out b2, out r2);
+                Geometry.ClosestPoints(a1, b1, a2, b2, out p1, out p2);
+                worst = Math.Max(worst, (r1 + r2 - Vec3.Distance(p1, p2)) / (r1 + r2));
+            }
+        Check(worst < 0.05f, "deepest overlap " + (Math.Max(0f, worst) * 100f).ToString("0") + "% of their radii");
+        var widest = 0.0;
+        foreach (var s in sims) widest = Math.Max(widest, OffFlow(s, Up));
+        Check(widest < 25.0, "spread " + widest.ToString("0") + " deg from the flow at most");
+        foreach (var s in sims) Check(s.Fill > 0.7f && s.Recoveries == 0, "inflated " + s.Fill.ToString("0.00") + ", stable");
+    }
+
+    private static CanopyShape WithRiser(float radius, float riser)
+    {
+        var s = CanopyShape.Synthetic(radius, 0.75f, 2.4f);
+        // Same canopy, hung from the end of a riser: lines meet riser metres up the axis.
+        var lift = riser;
+        for (var i = 0; i < s.ProfileH.Length; i++) s.ProfileH[i] += lift;
+        s.HemHeight += lift;
+        s.Confluence = s.Axis * riser;
+        return s;
+    }
+
+    private static void RiserPaysOutAndHolds()
+    {
+        Begin("riser: shock cord pays out first, then holds the confluence out from the part");
+        var shape = WithRiser(4f, 5f);
+        var sim = new CanopySim(CanopyLattice.Build(shape, LatticeResolution.Medium), new SimParameters(), 23);
+        sim.BeginDeploy(Up);
+        var env = Kerbin(Down * 45f);
+        var flyingAt = -1f;
+        for (var t = 0f; t < 10f; t += 0.02f)
+        {
+            sim.Step(0.02f, env, null);
+            if (flyingAt < 0f && sim.Phase == CanopyPhase.Flying) flyingAt = t;
+        }
+        var conf = sim.Positions[sim.Lattice.ConfluenceIndex];
+        Check(flyingAt > 0f && flyingAt < 3f, "out of the pack at t=" + flyingAt.ToString("0.00") + " s");
+        Check(Math.Abs(conf.Length - 5f) < 0.15f, "confluence " + conf.Length.ToString("0.00") + " m out on a 5 m riser");
+        Check(Vec3.Dot(conf.Normalized, Up) > 0.97f, "riser in line with the pull");
+        Check(sim.Fill > 0.8f && sim.Recoveries == 0, "canopy open " + sim.Fill.ToString("0.00"));
+    }
+
+    /// <summary>A model's worth of vertices: dome, lines drawn as thin cylinders with vertices only at their ends, riser.</summary>
+    private static List<Vec3> ModelVertices(CanopyShape s, Vec3 confluence, Vec3 riserBase, int lines, Quat turn, Vec3 shift)
+    {
+        var v = new List<Vec3>();
+        var rng = new Random(5);
+        for (var i = 0; i < 600; i++)
+        {
+            float rho, h;
+            s.ProfileAt((float)rng.NextDouble(), out rho, out h);
+            var th = (float)(rng.NextDouble() * Math.PI * 2);
+            v.Add(s.Axis * h + (s.E1 * (float)Math.Cos(th) + s.E2 * (float)Math.Sin(th)) * rho);
+        }
+        Action<Vec3, Vec3> cord = (a, b) =>
+        {
+            var dir = (b - a).Normalized;
+            var p = Vec3.AnyPerpendicular(dir);
+            var q = Vec3.Cross(dir, p);
+            for (var k = 0; k < 4; k++)
+            {
+                var o = (p * (float)Math.Cos(k * 1.57f) + q * (float)Math.Sin(k * 1.57f)) * 0.02f;
+                v.Add(a + o);
+                v.Add(b + o);
+            }
+        };
+        for (var l = 0; l < lines; l++) cord(s.HemPoint(MathX.TwoPi * l / lines), confluence);
+        cord(riserBase, confluence);
+        for (var i = 0; i < v.Count; i++) v[i] = turn * v[i] + shift;
+        return v;
+    }
+
+    private static void FindsRisersInModels()
+    {
+        Begin("fitting: finds where the lines meet, and the riser and junction below them");
+        var shape = WithRiser(4f, 5f);
+        var single = ModelVertices(shape, shape.Confluence, Vec3.Zero, 16, Quat.Identity, Vec3.Zero);
+        var fit = CanopyFitter.Fit(single.ToArray(), 0);
+        Check(fit.Ok && Math.Abs(fit.Canopies[0].RiserLength - 5f) < 0.1f,
+            "single canopy: riser " + (fit.Ok ? fit.Canopies[0].RiserLength.ToString("0.00") : "-") + " m (5 m modelled)");
+        var emb = CanopyEmbedding.Compute(CanopyLattice.Build(fit.Canopies[0], LatticeResolution.Medium), single.ToArray(), null, null);
+        Check(emb.MaxLineOffset < 0.1f && emb.MaxRiserOffset < 0.1f,
+            "every cord vertex on its cord (" + emb.MaxLineOffset.ToString("0.00") + " / " + emb.MaxRiserOffset.ToString("0.00") + " m off)");
+
+        // Three canopies fanned 15 degrees out, each on its own riser from a strap shared up to 1.5 m.
+        var all = new List<Vec3>();
+        var junction = Up * 1.5f;
+        for (var c = 0; c < 3; c++)
+        {
+            var turn = Quat.AngleAxis(0.26f, new Vec3((float)Math.Cos(c * 2.09f), 0f, (float)Math.Sin(c * 2.09f)));
+            var conf = turn * shape.Confluence;
+            var own = ModelVertices(shape, shape.Confluence, Vec3.Zero, 16, turn, Vec3.Zero);
+            // Replace this canopy's straight riser with junction -> confluence.
+            own.RemoveRange(own.Count - 8, 8);
+            for (var k = 0; k < 4; k++)
+            {
+                var o = new Vec3(0.02f * (float)Math.Cos(k * 1.57f), 0f, 0.02f * (float)Math.Sin(k * 1.57f));
+                own.Add(junction + o);
+                own.Add(conf + o);
+            }
+            all.AddRange(own);
+        }
+        for (var k = 0; k < 4; k++)
+        {
+            var o = new Vec3(0.02f * (float)Math.Cos(k * 1.57f), 0f, 0.02f * (float)Math.Sin(k * 1.57f));
+            for (var h = 0f; h <= 1.5f; h += 0.25f) all.Add(Up * h + o);
+        }
+        var cluster = CanopyFitter.Fit(all.ToArray(), 3);
+        Check(cluster.Ok && cluster.Canopies.Count == 3, "cluster: three canopies");
+        if (cluster.Ok)
+        {
+            var j = cluster.Canopies[0].RiserJunction.Length;
+            Check(Math.Abs(j - 1.5f) < 0.3f, "shared strap to " + j.ToString("0.00") + " m (1.5 m modelled)");
+            Check(!cluster.SharedConfluence, "each canopy keeps its own confluence");
+        }
+    }
+
+    private static void WindOnlyAsMuchAsTheCraftFeels()
+    {
+        Begin("wind: the canopy feels the share of the wind the craft's own aerodynamics does");
+        var velocity = new Vec3(3f, -7.5f, 0f);  // drifting 3 m/s, falling 7.5 m/s
+        var wind = new Vec3(10f, 0f, 0f);
+        // Drag along the air the craft really meets, for a few shares of the wind.
+        foreach (var share in new[] { 0f, 0.4f, 1f })
+        {
+            var air = velocity - wind * share;
+            var push = -air.Normalized * 9.81f;
+            var f = WindResponse.Factor(velocity, wind, push);
+            Check(Math.Abs(f - share) < 0.02f, "craft moved by " + (share * 100f).ToString("0") + "% of the wind: canopy given " + (f * 100f).ToString("0") + "%");
+        }
+        Check(WindResponse.Factor(velocity, wind, Vec3.Zero) < 0f, "no push, no verdict");
+        Check(WindResponse.Factor(velocity, Vec3.Zero, Up * 9.81f) < 0f, "no wind, no verdict");
     }
 
     private static void IsCheapEnough()

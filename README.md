@@ -58,25 +58,36 @@ differently because the air is different.
 - **Vacuum**: the pack still leaves the part, but nothing fills it. The canopy hangs limp
   in whatever shape its momentum leaves it.
 
+**Trails the air it meets.** An open canopy pulls along the airflow it actually meets,
+so it streams straight behind the craft, swings back when knocked aside, and settles
+rather than gliding off to one side.
+
 **Wind.** With [Kerbal Weather Project](https://github.com/cmac994/KerbalWeatherProject)
-the canopy sees the same wind KWP's aerodynamics do, and leans, drifts and swings with it.
-Any other wind mod that registers with FAR works too. Small gusts make canopies breathe and
+the canopy sees KWP's wind, and any other wind mod that registers with FAR works too. The
+canopy never pushes the craft, so it has to agree with the parachute module's own drag.
+It therefore gets exactly as much of the wind as the craft's own aerodynamics feel: all
+of it under FAR, less in stock (where KWP applies only part of the wind's force to
+parachutes), none with RealChute, whose drag ignores wind. A canopy never streams off
+sideways from a craft that is falling straight down. Small gusts make canopies breathe and
 flutter even in still air.
 
 **Things it touches.** Canopies collapse onto the ground when you land and drape over
 terrain, KSC buildings, Parallax's scatter rocks, your lander, kerbals and other vessels.
 On water they spread out and float low - and with [Scatterer](https://github.com/LGhassen/Scatterer)'s
 craft wave interactions on, they ride its waves, each part of the canopy on the wave under
-it. Canopies in a cluster push each other apart.
+it. Canopies are solid to one another - cluster-mates, the craft's other chutes, other
+craft's - and a cluster spreads apart the way real ones do.
 
 **Cut it and it flies away.** A cut canopy - or one whose part was destroyed - keeps
-flying on its own for half a minute before it is tidied away.
+flying on its own until it is out of range, has settled on the ground or the sea, or half
+a minute has passed.
 
 **Uses your models.** The canopy you see is the part's own mesh, deformed. Stock, ReStock,
 RealChute's canopy models and textures, [Custom Parachute Message](https://github.com/Icecovery/CustomParachuteMessage)'s
 encoded canopies, TexturesUnlimited recolours, KSP's heat glow and part highlighting all
 carry over. Cluster models (RealChute's triple, ReStock's Mk16-XL) are recognised as
-separate canopies.
+separate canopies, and each canopy's lines, riser (shock cord) and any shared strap are
+found where the model has them, so they hold their shape as the canopy moves.
 
 <p align="center">
   <img src="docs/images/stock-mk16-mesh.png" width="760" alt="The stock Mk16 canopy mesh as modelled, and deformed by the simulation in a crosswind">
@@ -137,14 +148,15 @@ In-game: **Settings → Difficulty options → ParaSoft**, per save.
 | Wind moves canopies | on | KWP's wind, or any wind registered with FAR. |
 | Turbulence | 1.00 | Small gusts that make canopies breathe and flutter. |
 | Kerbal EVA parachutes | on | Simulate kerbals' parachutes too, where their shape allows. |
-| Cut canopies linger (s) | 30 | How long a cut canopy keeps flying. |
+| Cut canopies linger (s) | 30 | Longest a cut canopy keeps flying. It goes sooner once it is 750 m from the camera and your craft, or has settled on the ground or sea. |
 
 Every part with a softbody canopy also shows its state in its right-click menu:
 *deploying*, *reefed, 40% full*, *92% inflated*, *collapsed*, *limp (no airflow)*.
 
 `GameData/ParaSoft/Settings.cfg` holds the physical constants - fabric weight, porosity,
-filling time, the mass of air a canopy drags along, stiffness, ejection speed, level of
-detail distances and the canopy budget - each documented in the file.
+filling time, the mass of air a canopy drags along, stiffness, how firmly canopies trail
+the airflow, ejection speed, level of detail distances, the canopy budget and how far away
+cut canopies are removed - each documented in the file.
 
 To keep one part's canopy animated the old way, patch its module:
 
@@ -178,9 +190,10 @@ any more deploy with their own animation.
 | **RealChute** | ✅ Every `RealChuteModule` parachute, including dual chutes (main and drogue each simulated), RealChute's canopy models and textures, and its material weights. |
 | **FAR** | ✅ FAR's built-in RealChuteLite (`RealChuteFAR`). FAR's aerodynamics are untouched - ParaSoft never applies a force. |
 | **Custom Parachute Message** | ✅ Its encoded canopy is fitted like any other and keeps its shader - the message deforms with the fabric. |
-| **Kerbal Weather Project** | ✅ Canopies use KWP's wind. |
+| **Kerbal Weather Project** | ✅ Canopies use KWP's wind, as much of it as the craft itself is feeling. |
 | **Scatterer** | ✅ Canopies float on the sea, and ride its waves when its craft wave interactions are on. |
-| **ReStock** | ✅ Its skinned canopies, including the Mk16-XL's three-canopy cluster. |
+| **ReStock** | ✅ Its skinned canopies, including the Mk16-XL's three-canopy cluster and its shared riser. |
+| **Other mods' parachutes** | ✅ Any round canopy on stock `ModuleParachute` or RealChute (Tantares, Bluedog, Boring Crew Services' Starliner and others) is fitted the same way, risers and clusters included. |
 | **KerbalFX** | ✅ A small patch keeps AeroFX's ribbons off parachute parts, whose original (hidden) canopy mesh would otherwise anchor them. |
 | **Parallax** | ✅ Canopies land on collideable scatter. |
 | **PlanetShine, Deferred, TUFX, TexturesUnlimited** | ✅ Canopies are drawn with the parts' own materials. |
